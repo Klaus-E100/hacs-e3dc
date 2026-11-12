@@ -1,0 +1,935 @@
+"""Diagnostics support for E3DC RSCP."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from functools import wraps
+import logging
+from typing import Any
+from threading import Lock
+
+from e3dc import E3DC, SendError, NotAvailableError, RSCPKeyError, AuthenticationError
+from e3dc._rscpLib import rscpFindTag, rscpFindTagIndex
+from e3dc._rscpTags import RscpTag, RscpType, PowermeterType
+from e3dc._e3dc_rscp_local import DEFAULT_PORT as RSCP_PORT
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME, CONF_PORT
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+
+from .const import CONF_RSCPKEY
+
+_LOGGER = logging.getLogger(__name__)
+
+FARM_PARAM_SERIALNO = "FARM_PARAM_SERIALNO"
+
+
+class ThreadSafeE3DC(E3DC):
+    """Thread-safe version of E3DC."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        """Initialize the thread-safe E3DC."""
+        self._lock = Lock()
+        super().__init__(*args, **kwargs)
+
+    def sendRequest(self, *args, **kwargs) -> Any:
+        """Thread-safe sendRequest."""
+        with self._lock:
+            return super().sendRequest(*args, **kwargs)
+
+
+def e3dc_call(func) -> Callable[..., Any]:
+    """Wrap e3dc call in boilerplate exception handling."""
+
+    @wraps(func)
+    def wrapper_handle_e3dc_ex(*args, **kwargs) -> Any:
+        """Send a call to E3DC asynchronusly and do general exception handling."""
+        try:
+            return func(*args, **kwargs)
+        except NotAvailableError as ex:
+            _LOGGER.debug("E3DC is unavailable: %s", ex, exc_info=True)
+            raise HomeAssistantError(
+                "Communication Failure: E3DC not available"
+            ) from ex
+        except SendError as ex:
+            _LOGGER.debug("Communication error with E3DC: %s", ex, exc_info=True)
+            raise HomeAssistantError(
+                "Communication Failure: Failed to send data"
+            ) from ex
+        except AuthenticationError as ex:
+            _LOGGER.debug("Failed to authenticate with E3DC: %s", ex, exc_info=True)
+            raise ConfigEntryAuthFailed("Failed to authenticate with E3DC") from ex
+        except RSCPKeyError as ex:
+            _LOGGER.debug(
+                "Encryption error with E3DC, key invalid: %s", ex, exc_info=True
+            )
+            raise ConfigEntryAuthFailed(
+                "Encryption Error with E3DC, key invalid"
+            ) from ex
+        except (HomeAssistantError, ConfigEntryAuthFailed):
+            raise
+        except Exception as ex:
+            _LOGGER.debug("Fatal error when talking to E3DC: %s", ex, exc_info=True)
+            raise HomeAssistantError("Fatal error when talking to E3DC") from ex
+
+    return wrapper_handle_e3dc_ex
+
+
+class E3DCProxy:
+    """Proxies requests to pye3dc, takes care of error and async handling."""
+
+    def __init__(
+        self, _hass: HomeAssistant, _config: ConfigEntry | dict[str, str | int]
+    ) -> None:
+        """Initialize E3DC Proxy and connect."""
+        # TODO: move to readonly properties
+        self.e3dc: E3DC = None
+        self.e3dc_config: dict[str, Any] = {}
+        self._hass: HomeAssistant = _hass
+        self._config: ConfigEntry = _config
+        self._host: str
+        self._username: str
+        self._password: str
+        self._rscpkey: str
+        self._port: int
+
+        if isinstance(_config, ConfigEntry):
+            self._host = self._config.data.get(CONF_HOST)
+            self._username = self._config.data.get(CONF_USERNAME)
+            self._password = self._config.data.get(CONF_PASSWORD)
+            self._rscpkey = self._config.data.get(CONF_RSCPKEY)
+            self._port = self._config.data.get(CONF_PORT, RSCP_PORT)
+        else:
+            self._host = _config[CONF_HOST]
+            self._username = _config[CONF_USERNAME]
+            self._password = _config[CONF_PASSWORD]
+            self._rscpkey = _config[CONF_RSCPKEY]
+            self._port = _config.get(CONF_PORT, RSCP_PORT)
+
+    @e3dc_call
+    def connect(self, config: dict[str, Any] | None = None) -> None:
+        """Connect to E3DC with an optional device setup."""
+        if config is None:
+            config = {}
+
+        self.e3dc = ThreadSafeE3DC(
+            E3DC.CONNECT_LOCAL,
+            username=self._username,
+            password=self._password,
+            ipAddress=self._host,
+            key=self._rscpkey,
+            port=self._port,
+            configuration=config,
+        )
+
+        self.e3dc_config = config
+
+    @e3dc_call
+    def disconnect(self) -> None:
+        """Disconnect from E3DC if connected."""
+        if self.e3dc is None:
+            return
+        if self.e3dc.rscp.isConnected():
+            self.e3dc.disconnect()
+        self.e3dc = None
+
+    @e3dc_call
+    def get_db_data(self, timestamp: int, timespan_seconds: int) -> dict[str, Any]:
+        """Return the statics data for the specified timespan."""
+        return self.e3dc.get_db_data_timestamp(timestamp, timespan_seconds, True)
+
+    @e3dc_call
+    def get_db_data_timespan(self, timespan: str) -> dict[str, Any]:
+        """Return DB statistics for DAY, MONTH or YEAR."""
+        return self.e3dc.get_db_data(timespan=timespan, keepAlive=True)
+
+    @e3dc_call
+    def get_manual_charge(self) -> dict[str, Any]:
+        """Poll manual charging state."""
+        data = self.e3dc.sendRequest(
+            (RscpTag.EMS_REQ_GET_MANUAL_CHARGE, RscpType.NoneType, None),
+            keepAlive=True,
+        )
+
+        result: dict[str, Any] = {}
+        result["active"] = rscpFindTag(data, RscpTag.EMS_MANUAL_CHARGE_ACTIVE)[2]
+
+        # These seem to be kAh per individual cell, so this is considered very strange.
+        # To get this working for a start, we assume 3,65 V per cell, taking my own unit
+        # as a base, but this obviously will need some real work to base this on
+        # current voltages.
+        # Round to Watts, this should prevent negative values in the magnitude of 10^-6,
+        # which are probably floating point errors.
+        tmp = rscpFindTag(data, RscpTag.EMS_MANUAL_CHARGE_ENERGY_COUNTER)[2]
+        powerfactor = 3.65
+        result["energy"] = round(tmp * powerfactor, 3)
+
+        # The timestamp seem to correctly show the UTC Date when manual charging started
+        # Not yet enabled, just for reference.
+        # self._mydata["manual-charge-start"] = rscpFindTag(
+        #     request_data, "EMS_MANUAL_CHARGE_LASTSTART"
+        # )[2]
+
+        return result
+
+    @e3dc_call
+    def get_power_settings(self) -> dict[str, Any]:
+        """Retrieve current power settings."""
+        return self.e3dc.get_power_settings(keepAlive=True)
+
+    @e3dc_call
+    def get_system_status(self) -> dict[str, Any]:
+        """Load E3DC system status flags."""
+        return self.e3dc.get_system_status(keepAlive=True)
+
+    @e3dc_call
+    def get_powermeters(self) -> dict[str, Any]:
+        """Load available powermeters from E3DC."""
+        return self.e3dc.get_powermeters(keepAlive=True)
+
+    def _resolve_pvi_string_count(
+        self, pvi_index: int, used_fallback: int | None
+    ) -> int:
+        """Return DC string count preferring max over used (#413).
+
+        Some firmwares report ``PVI_USED_STRING_COUNT`` too low while further
+        DC inputs still produce. Prefer ``PVI_DC_MAX_STRING_COUNT``; fall back
+        to used (from RSCP or pye3dc discovery) if max is missing.
+        """
+        req = self.e3dc.sendRequest(
+            (
+                RscpTag.PVI_REQ_DATA,
+                RscpType.Container,
+                [
+                    (RscpTag.PVI_INDEX, RscpType.Uint16, pvi_index),
+                    (RscpTag.PVI_REQ_DC_MAX_STRING_COUNT, RscpType.NoneType, None),
+                    (RscpTag.PVI_REQ_USED_STRING_COUNT, RscpType.NoneType, None),
+                ],
+            ),
+            keepAlive=True,
+        )
+        max_count = rscpFindTagIndex(req, RscpTag.PVI_DC_MAX_STRING_COUNT)
+        if max_count is not None:
+            return int(max_count)
+        used = rscpFindTagIndex(req, RscpTag.PVI_USED_STRING_COUNT)
+        if used is not None:
+            return int(used)
+        return int(used_fallback or 0)
+
+    @e3dc_call
+    def get_pvis(self) -> list[dict[str, Any]]:
+        """Load available PV inverters from E3DC.
+
+        Overrides pye3dc's ``strings`` (from ``PVI_USED_STRING_COUNT``) with
+        ``PVI_DC_MAX_STRING_COUNT`` when available so all live DC inputs get
+        sensors (#413).
+        """
+        pvis = self.e3dc.get_pvis(keepAlive=True)
+        for pvi in pvis:
+            pvi["strings"] = self._resolve_pvi_string_count(
+                int(pvi["index"]), pvi.get("strings")
+            )
+        return pvis
+
+    @e3dc_call
+    def get_wallbox_ems_settings(self) -> dict[str, Any]:
+        """Load wallbox EMS settings."""
+        beforeCarMode: int = self.e3dc.sendRequestTag(
+            RscpTag.EMS_REQ_BATTERY_BEFORE_CAR_MODE, keepAlive=True
+        )
+        batToCarMode: int = self.e3dc.sendRequestTag(
+            RscpTag.EMS_REQ_BATTERY_TO_CAR_MODE, keepAlive=True
+        )
+        batWBDischargeLimit: int = self.e3dc.sendRequestTag(
+            RscpTag.EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL, keepAlive=True
+        )
+        wbEnforcePowerAssignment: bool = self.e3dc.sendRequestTag(
+            RscpTag.EMS_REQ_GET_WALLBOX_ENFORCE_POWER_ASSIGNMENT, keepAlive=True
+        )
+
+        # sendRequestTag may return None if the response could not be parsed,
+        # treat this as an error instead of silently reporting wrong states.
+        if beforeCarMode is None or batToCarMode is None:
+            raise HomeAssistantError(
+                "Failed to load wallbox EMS settings, got no data from E3DC"
+            )
+
+        result: dict[str, Any] = {}
+        result["battery-before-car-mode"] = beforeCarMode != 0
+        result["battery-to-car-mode"] = batToCarMode != 0
+        result["battery-wallbox-discharge-limit"] = batWBDischargeLimit
+        result["wallbox-enforce-power-assignment"] = bool(wbEnforcePowerAssignment)
+        return result
+
+    @e3dc_call
+    def get_wallbox_data(self, wallbox_index: int) -> dict[str, Any]:
+        """Poll current wallbox readings."""
+        return self.e3dc.get_wallbox_data(wbIndex=wallbox_index, keepAlive=True)
+
+    @e3dc_call
+    def get_wallbox_identification_data(self, wallbox_index: int) -> dict[str, Any]:
+        """Get identification data for wallbox with given index."""
+        req = self.e3dc.sendRequest(
+            (
+                "WB_REQ_DATA",
+                "Container",
+                [
+                    ("WB_INDEX", "UChar8", wallbox_index),
+                    ("WB_REQ_FIRMWARE_VERSION", "None", None),
+                    ("WB_REQ_MAC_ADDRESS", "None", None),
+                    ("WB_REQ_DEVICE_NAME", "None", None),
+                    ("WB_REQ_SERIAL", "None", None),
+                    ("WB_REQ_WALLBOX_TYPE", "None", None),
+                    ("WB_REQ_LOWER_CURRENT_LIMIT", "None", None),
+                    ("WB_REQ_UPPER_CURRENT_LIMIT", "None", None),
+                ],
+            ),
+            keepAlive=True,
+        )
+
+        outObj = {
+            "index": rscpFindTagIndex(req, "WB_INDEX"),
+        }
+
+        firmware_version = rscpFindTag(req, "WB_FIRMWARE_VERSION")
+        if firmware_version is not None:
+            outObj["firmwareVersion"] = rscpFindTagIndex(
+                firmware_version, "WB_FIRMWARE_VERSION"
+            )
+
+        device_name = rscpFindTag(req, "WB_DEVICE_NAME")
+        if device_name is not None:
+            outObj["deviceName"] = rscpFindTagIndex(device_name, "WB_DEVICE_NAME")
+
+        wallbox_serial = rscpFindTag(req, "WB_SERIAL")
+        if wallbox_serial is not None:
+            outObj["wallboxSerial"] = rscpFindTagIndex(wallbox_serial, "WB_SERIAL")
+
+        mac_address = rscpFindTag(req, "WB_MAC_ADDRESS")
+        if mac_address is not None:
+            outObj["macAddress"] = rscpFindTagIndex(mac_address, "WB_MAC_ADDRESS")
+
+        wallbox_type = rscpFindTag(req, "WB_WALLBOX_TYPE")
+        if wallbox_type is not None:
+            outObj["wallboxType"] = rscpFindTagIndex(wallbox_type, "WB_WALLBOX_TYPE")
+
+        lower_current_limit = rscpFindTag(req, "WB_LOWER_CURRENT_LIMIT")
+        if lower_current_limit is not None:
+            outObj["lowerCurrentLimit"] = rscpFindTagIndex(
+                lower_current_limit, "WB_LOWER_CURRENT_LIMIT"
+            )
+
+        upper_current_limit = rscpFindTag(req, "WB_UPPER_CURRENT_LIMIT")
+        if upper_current_limit is not None:
+            outObj["upperCurrentLimit"] = rscpFindTagIndex(
+                upper_current_limit, "WB_UPPER_CURRENT_LIMIT"
+            )
+
+        return outObj
+
+    @e3dc_call
+    def get_batteries(self) -> list[dict[str, Any]]:
+        """Return general information about installed batteries."""
+        return self.e3dc.get_batteries()
+
+    @e3dc_call
+    def get_battery_data(self) -> list[dict[str, Any]]:
+        """Return sensor data for all installed battery packs."""
+        # Get battery configuration to determine how many packs exist
+        batteries_config = self.e3dc.get_batteries()
+
+        if not isinstance(batteries_config, list) or len(batteries_config) == 0:
+            # No batteries configured, return empty list
+            return []
+
+        # Fetch data for each battery pack
+        battery_data_list = []
+        for battery_config in batteries_config:
+            pack_index = battery_config.get("index", 0)
+            pack_data = self.e3dc.get_battery_data(batIndex=pack_index)
+            battery_data_list.append(pack_data)
+
+        return battery_data_list
+
+    def _pvi_value(self, req: Any, tag: RscpTag) -> float | None:
+        """Extract a PVI_VALUE float from a tagged response container."""
+        found = rscpFindTag(req, tag)
+        if found is None:
+            return None
+        value = rscpFindTagIndex(found, RscpTag.PVI_VALUE)
+        return None if value is None else float(value)
+
+    def _pvi_phase_metrics(self, phase_index: int) -> dict[str, float | None]:
+        """Return AC power/voltage/current for one inverter phase (0 = L1)."""
+        req = self.e3dc.sendRequest(
+            (
+                RscpTag.PVI_REQ_DATA,
+                RscpType.Container,
+                [
+                    (RscpTag.PVI_INDEX, RscpType.Uint16, 0),
+                    (RscpTag.PVI_REQ_AC_POWER, RscpType.Uint16, phase_index),
+                    (RscpTag.PVI_REQ_AC_VOLTAGE, RscpType.Uint16, phase_index),
+                    (RscpTag.PVI_REQ_AC_CURRENT, RscpType.Uint16, phase_index),
+                ],
+            ),
+            keepAlive=True,
+        )
+        return {
+            "power": self._pvi_value(req, RscpTag.PVI_AC_POWER),
+            "voltage": self._pvi_value(req, RscpTag.PVI_AC_VOLTAGE),
+            "current": self._pvi_value(req, RscpTag.PVI_AC_CURRENT),
+        }
+
+    def _pvi_aux_metrics(self) -> dict[str, Any]:
+        """Return AC frequency, modes and PVI temperatures for the first inverter."""
+        req = self.e3dc.sendRequest(
+            (
+                RscpTag.PVI_REQ_DATA,
+                RscpType.Container,
+                [
+                    (RscpTag.PVI_INDEX, RscpType.Uint16, 0),
+                    (RscpTag.PVI_REQ_AC_FREQUENCY, RscpType.NoneType, None),
+                    (RscpTag.PVI_REQ_SYSTEM_MODE, RscpType.NoneType, None),
+                    (RscpTag.PVI_REQ_POWER_MODE, RscpType.NoneType, None),
+                    (RscpTag.PVI_REQ_TEMPERATURE_COUNT, RscpType.NoneType, None),
+                ],
+            ),
+            keepAlive=True,
+        )
+        result: dict[str, Any] = {
+            "pvi-frequency": self._pvi_value(req, RscpTag.PVI_AC_FREQUENCY),
+            "pvi-system-mode": rscpFindTagIndex(req, RscpTag.PVI_SYSTEM_MODE),
+            "pvi-power-mode": rscpFindTagIndex(req, RscpTag.PVI_POWER_MODE),
+        }
+        temp_count = rscpFindTagIndex(req, RscpTag.PVI_TEMPERATURE_COUNT)
+        count = int(temp_count or 0)
+        for temp_index in range(count):
+            temp_req = self.e3dc.sendRequest(
+                (
+                    RscpTag.PVI_REQ_DATA,
+                    RscpType.Container,
+                    [
+                        (RscpTag.PVI_INDEX, RscpType.Uint16, 0),
+                        (RscpTag.PVI_REQ_TEMPERATURE, RscpType.Uint16, temp_index),
+                    ],
+                ),
+                keepAlive=True,
+            )
+            # 1-based sensor numbers for entity keys.
+            result[f"pvi-temperature-{temp_index + 1}"] = self._pvi_value(
+                temp_req, RscpTag.PVI_TEMPERATURE
+            )
+        return result
+
+    @e3dc_call
+    def get_pvi_temperature_count(self) -> int:
+        """Return number of PVI temperature sensors on the first inverter."""
+        req = self.e3dc.sendRequest(
+            (
+                RscpTag.PVI_REQ_DATA,
+                RscpType.Container,
+                [
+                    (RscpTag.PVI_INDEX, RscpType.Uint16, 0),
+                    (RscpTag.PVI_REQ_TEMPERATURE_COUNT, RscpType.NoneType, None),
+                ],
+            ),
+            keepAlive=True,
+        )
+        temp_count = rscpFindTagIndex(req, RscpTag.PVI_TEMPERATURE_COUNT)
+        return int(temp_count or 0)
+
+    def _pvi_string_metrics(self, string_index: int) -> dict[str, float | None]:
+        """Return DC power/voltage/current/energy for one PV string (0 = first)."""
+        req = self.e3dc.sendRequest(
+            (
+                RscpTag.PVI_REQ_DATA,
+                RscpType.Container,
+                [
+                    (RscpTag.PVI_INDEX, RscpType.Uint16, 0),
+                    (RscpTag.PVI_REQ_DC_POWER, RscpType.Uint16, string_index),
+                    (RscpTag.PVI_REQ_DC_VOLTAGE, RscpType.Uint16, string_index),
+                    (RscpTag.PVI_REQ_DC_CURRENT, RscpType.Uint16, string_index),
+                    (
+                        RscpTag.PVI_REQ_DC_STRING_ENERGY_ALL,
+                        RscpType.Uint16,
+                        string_index,
+                    ),
+                ],
+            ),
+            keepAlive=True,
+        )
+
+        def _value(tag: RscpTag, digits: int) -> float | None:
+            found = rscpFindTag(req, tag)
+            if found is None:
+                return None
+            value = rscpFindTagIndex(found, RscpTag.PVI_VALUE)
+            if value is None:
+                return None
+            # Round float32 RSCP noise so history/automations stay clean
+            # (UI already uses suggested_display_precision).
+            return round(float(value), digits)
+
+        return {
+            "power": _value(RscpTag.PVI_DC_POWER, 0),
+            "voltage": _value(RscpTag.PVI_DC_VOLTAGE, 1),
+            "current": _value(RscpTag.PVI_DC_CURRENT, 2),
+            "energy": _value(RscpTag.PVI_DC_STRING_ENERGY_ALL, 0),
+        }
+
+    def pvi_string_count(self) -> int:
+        """Return DC string count of the first PVI (0 if unknown).
+
+        Uses the value stored by :meth:`get_pvis`, which prefers max DC
+        string count over used-string count (#413).
+        """
+        pvis = getattr(self.e3dc, "pvis", None) or []
+        if not pvis:
+            return 0
+        return int(pvis[0].get("strings") or 0)
+
+    @e3dc_call
+    def get_pvi_strings_data(self) -> dict[str, Any]:
+        """Poll DC metrics for each PV string/tracker on the first PVI."""
+        result: dict[str, Any] = {}
+        for string_index in range(self.pvi_string_count()):
+            metrics = self._pvi_string_metrics(string_index)
+            # 1-based string numbers for entity keys (String 1 / String 2).
+            prefix = f"pvi-string-{string_index + 1}"
+            for metric, value in metrics.items():
+                result[f"{prefix}-{metric}"] = value
+        return result
+
+    @e3dc_call
+    def get_powermeters_data(self) -> dict[str, Any]:
+        """Poll powermeters and derive per-phase grid/inverter/house metrics."""
+        data = self.e3dc.get_powermeters_data(keepAlive=True)
+        result: dict[str, Any] = {}
+        phases = ("L1", "L2", "L3")
+        grid = dict.fromkeys(phases, 0.0)
+        grid_energy: dict[str, float | None] = dict.fromkeys(phases)
+        grid_voltage: dict[str, float | None] = dict.fromkeys(phases)
+        additional = dict.fromkeys(phases, 0.0)
+
+        # Process and aggregate the data for each found powermeter
+        for meter in data:
+            # TODO: Rewrite the config so that we can index into it.
+            for config in self.e3dc_config["powermeters"]:
+                if meter["index"] != config["index"]:
+                    continue
+
+                sign = -1 if config["negate-measure"] else 1
+                power = {phase: sign * meter["power"][phase] for phase in phases}
+                energy = meter.get("energy") or {}
+
+                if meter["type"] == PowermeterType.PM_TYPE_ROOT.value:
+                    grid = power
+                    for phase in phases:
+                        raw = energy.get(phase)
+                        grid_energy[phase] = None if raw is None else float(raw)
+                    voltage = meter.get("voltage") or {}
+                    for phase in phases:
+                        raw = voltage.get(phase)
+                        grid_voltage[phase] = None if raw is None else float(raw)
+                    continue
+
+                result[config["key"]] = sum(power.values())
+                # TODO: Store the total key in the config as well.
+                result[config["key"] + "-total"] = sign * sum(
+                    float(energy.get(phase) or 0) for phase in phases
+                )
+                for phase in phases:
+                    additional[phase] += power[phase]
+                    raw = energy.get(phase)
+                    key = phase.lower()
+                    result[f"{config['key']}-energy-{key}"] = (
+                        None if raw is None else sign * float(raw)
+                    )
+
+        for index, phase in enumerate(phases):
+            metrics = self._pvi_phase_metrics(index)
+            key = phase.lower()
+            power = metrics["power"]
+            pvi_power = 0.0 if power is None else power
+            result[f"grid-{key}"] = grid[phase]
+            result[f"grid-energy-{key}"] = grid_energy[phase]
+            result[f"grid-voltage-{key}"] = grid_voltage[phase]
+            result[f"pvi-{key}"] = pvi_power
+            result[f"pvi-voltage-{key}"] = metrics["voltage"]
+            result[f"pvi-current-{key}"] = metrics["current"]
+            result[f"house-{key}"] = pvi_power + grid[phase] + additional[phase]
+
+        result.update(self._pvi_aux_metrics())
+        return result
+
+    @e3dc_call
+    def get_software_version(self) -> str:
+        """Return the current software version of the E3DC."""
+        return self.e3dc.sendRequestTag(RscpTag.INFO_REQ_SW_RELEASE, keepAlive=True)
+
+    @e3dc_call
+    def get_emergency_power_status(self) -> dict[str, Any]:
+        """Return EMS emergency power status (Modbus register 40084 equivalent)."""
+        status = self.e3dc.sendRequestTag(
+            RscpTag.EMS_REQ_EMERGENCY_POWER_STATUS, keepAlive=True
+        )
+        return {
+            "emergency-power-status": status,
+            "emergency-power-numeric-status": status,
+        }
+
+    @e3dc_call
+    def get_sgready_state(self) -> dict[str, Any]:
+        """Return the current SG Ready state of the E3DC."""
+
+        result_data = self.e3dc.sendRequest(
+            (
+                "SGR_REQ_DATA",
+                "Container",
+                [
+                    ("SGR_INDEX", RscpType.Uint16, 0),
+                    ("SGR_REQ_STATE", RscpType.NoneType, None),
+                ],
+            ),
+            keepAlive=True,
+        )
+        result: dict[str, Any] = {}
+        result["sgready-active"] = rscpFindTag(result_data, RscpTag.SGR_AKTIV)[2]
+        sgready_state = rscpFindTag(result_data, RscpTag.SGR_STATE)[2]
+        result["sgready-state"] = sgready_state
+        result["sgready-numeric-state"] = sgready_state
+
+        return result
+
+    @e3dc_call
+    def get_time(self) -> int:
+        """Get current local timestamp."""
+        return self.e3dc.sendRequestTag(RscpTag.INFO_REQ_TIME, keepAlive=True)
+
+    @e3dc_call
+    def get_timeutc(self) -> int:
+        """Get current local timestamp."""
+        return self.e3dc.sendRequestTag(RscpTag.INFO_REQ_UTC_TIME, keepAlive=True)
+
+    @e3dc_call
+    def get_timezone(self) -> str:
+        """Load the E3DC Timezone."""
+        return self.e3dc.sendRequestTag(RscpTag.INFO_REQ_TIME_ZONE, keepAlive=True)
+
+    @e3dc_call
+    def poll(self) -> dict[str, Any]:
+        """Poll E3DC current state."""
+        result: dict[str, Any] = self.e3dc.poll(keepAlive=True)
+
+        return result
+
+    @e3dc_call
+    def start_manual_charge(self, charge_amount_wh: int) -> None:
+        """Initiate the manual charging process, zero will stop charging."""
+        result_data = self.e3dc.sendRequest(
+            (RscpTag.EMS_REQ_START_MANUAL_CHARGE, RscpType.Uint32, charge_amount_wh),
+            keepAlive=True,
+        )
+        result: bool = result_data[2]
+
+        if not result:
+            _LOGGER.warning("Manual charging could not be activated")
+
+    @e3dc_call
+    def set_wallbox_sun_mode(self, enabled: bool, wallbox_index: int) -> None:
+        """Set wallbox charging mode to sun mode on/off.
+
+        Args:
+            enabled(bool): the desired state True = sun mode enabled, False = sun mode disabled
+            wallbox_index (Optional[int]): index of the requested wallbox,
+
+        Returns:
+            nothing
+
+        """
+        result: bool = self.e3dc.set_wallbox_sunmode(
+            enable=enabled, wbIndex=wallbox_index, keepAlive=True
+        )
+        if not result:
+            raise HomeAssistantError("Failed to set wallbox to sun mode %s", enabled)
+
+    @e3dc_call
+    def set_wallbox_schuko(self, enabled: bool, wallbox_index: int) -> None:
+        """Set wallbox power outlet (schuko) to on/off.
+
+        Args:
+            enabled(bool): the desired state True = on, False = off
+            wallbox_index (Optional[int]): index of the requested wallbox,
+
+        Returns:
+            nothing
+
+        """
+        result: bool = self.e3dc.set_wallbox_schuko(
+            enable=enabled, wbIndex=wallbox_index, keepAlive=True
+        )
+        if not result:
+            raise HomeAssistantError("Failed to set wallbox schuko to %s", enabled)
+
+    @e3dc_call
+    def toggle_wallbox_charging(self, wallbox_index: int) -> None:
+        """Toggle charging of the wallbox.
+
+        Args:
+            wallbox_index (Optional[int]): index of the requested wallbox,
+
+        Returns:
+            nothing
+
+        """
+        result: bool = self.e3dc.toggle_wallbox_charging(
+            wbIndex=wallbox_index, keepAlive=True
+        )
+        if not result:
+            raise HomeAssistantError("Failed to toggle wallbox charging")
+
+    @e3dc_call
+    def toggle_wallbox_phases(self, wallbox_index: int) -> None:
+        """Toggle the phases of wallbox charging between 1 and 3 phases.
+
+           Only works if "Phasen" in the portal/device is not set to Auto.
+
+        Args:
+            wallbox_index (Optional[int]): index of the requested wallbox,
+
+        Returns:
+            nothing
+
+        """
+        result: bool = self.e3dc.toggle_wallbox_phases(
+            wbIndex=wallbox_index, keepAlive=True
+        )
+        if not result:
+            raise HomeAssistantError("Failed to toggle wallbox phases")
+
+    @e3dc_call
+    def set_wallbox_max_charge_current(
+        self, max_charge_current: int, wallbox_index: int
+    ) -> bool:
+        """Set the maximum charge current of the wallbox via RSCP protocol locally.
+
+        Args:
+            max_charge_current (int): maximum allowed charge current in A
+            wallbox_index (Optional[int]): index of the requested wallbox
+
+        Returns:
+            True if success (wallbox has understood the request, but might have clipped the value)
+            False if error
+
+        """
+        _LOGGER.debug(
+            "Wallbox %s: Setting max_charge_current to %s",
+            wallbox_index,
+            max_charge_current,
+        )
+
+        return self.e3dc.set_wallbox_max_charge_current(
+            max_charge_current=max_charge_current, wbIndex=wallbox_index, keepAlive=True
+        )
+
+    @e3dc_call
+    def set_battery_before_car_mode(self, mode: bool) -> bool:
+        """Set the battery before car mode."""
+        _LOGGER.debug("Setting battery before car mode to %s", mode)
+        if mode:
+            _LOGGER.debug(
+                "Charging priority is battery, so we need to disable battery to car mode."
+            )
+            battocar = self.set_battery_to_car_mode(False)
+            if battocar is True:
+                raise HomeAssistantError(
+                    "Failed to disable battery to car mode: Cannot set battery before car mode"
+                )
+
+        result = self.e3dc.sendRequest(
+            (
+                RscpTag.EMS_REQ_SET_BATTERY_BEFORE_CAR_MODE,
+                RscpType.UChar8,
+                1 if mode else 0,
+            ),
+            keepAlive=True,
+        )
+        if result[2] == 255:
+            raise HomeAssistantError(
+                "Failed to set battery before car mode, invalid operation."
+            )
+        return False if result[2] == 0 else True
+
+    @e3dc_call
+    def set_battery_to_car_mode(self, mode: bool) -> bool:
+        """Set the battery to car mode."""
+        _LOGGER.debug("Setting battery to car mode to %s", mode)
+        result = self.e3dc.sendRequest(
+            (
+                RscpTag.EMS_REQ_SET_BATTERY_TO_CAR_MODE,
+                RscpType.UChar8,
+                1 if mode else 0,
+            ),
+            keepAlive=True,
+        )
+        if result[2] == 255:
+            raise HomeAssistantError(
+                "Failed to set battery to car mode, invalid operation."
+            )
+        return False if result[2] == 0 else True
+
+    @e3dc_call
+    def set_battery_wallbox_discharge_limit(self, limit: int) -> int:
+        """Set the battery wallbox discharge limit, returns the value E3DC reports back."""
+        # We don't get a sensible result here, E3DC returns the value
+        # EMS_SET_BATTERY_BEFORE_CAR_MODE instead, which does not help us.
+        # Thus, we need to query it afterwards.
+        _LOGGER.debug("Setting battery wallbox discharge limit to %s", limit)
+        self.e3dc.sendRequest(
+            (RscpTag.EMS_REQ_SET_WB_DISCHARGE_BAT_UNTIL, RscpType.Uint32, limit),
+            keepAlive=True,
+        )
+        return self.e3dc.sendRequestTag(
+            RscpTag.EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL, keepAlive=True
+        )
+
+    @e3dc_call
+    def set_wallbox_enforce_power_assignment(self, enforce: bool) -> bool:
+        """Set the wallbox enforce power assignment mode."""
+        _LOGGER.debug("Setting wallbox enforce power assignment to %s", enforce)
+        result = self.e3dc.sendRequest(
+            (
+                RscpTag.EMS_REQ_SET_WALLBOX_ENFORCE_POWER_ASSIGNMENT,
+                RscpType.Bool,
+                enforce,
+            ),
+            keepAlive=True,
+        )
+        return result[2]
+
+    @e3dc_call
+    def set_power_limits(
+        self,
+        enable: bool,
+        max_charge: int | None = None,
+        max_discharge: int | None = None,
+    ) -> None:
+        """Set or clear power limits."""
+        if not enable:
+            result: int = self.e3dc.set_power_limits(False, None, None, None, True)
+        else:
+            power_settings: list[tuple[RscpTag, RscpType, bool | int]] = [
+                (RscpTag.EMS_POWER_LIMITS_USED, RscpType.Bool, True)
+            ]
+            if max_discharge is not None:
+                power_settings.append(
+                    (
+                        RscpTag.EMS_MAX_DISCHARGE_POWER,
+                        RscpType.Uint32,
+                        max_discharge,
+                    )
+                )
+            if max_charge is not None:
+                power_settings.append(
+                    (
+                        RscpTag.EMS_MAX_CHARGE_POWER,
+                        RscpType.Uint32,
+                        max_charge,
+                    )
+                )
+
+            res = self.e3dc.sendRequest(
+                (
+                    RscpTag.EMS_REQ_SET_POWER_SETTINGS,
+                    RscpType.Container,
+                    power_settings,
+                ),
+                keepAlive=True,
+            )
+
+            # Aggregate all return codes: -1 error, 1 nonoptimal, 0 success.
+            result = 0
+            for response_item in res[2]:
+                if response_item[2] == -1:
+                    result = -1
+                elif response_item[2] == 1 and result == 0:
+                    result = 1
+
+        if result == -1:
+            raise HomeAssistantError("Failed to clear power limits")
+        if result == 1:
+            _LOGGER.warning("The given power limits are not optimal, continuing anyway")
+
+    @e3dc_call
+    def set_powersave(self, enabled: bool) -> None:
+        """Set powersaving flag."""
+        # The call would normally return the new state, however, various e3dc's
+        # react differently here, my E3DC does not work as the way e3dc lib is
+        # implemented, so so far we ignore the return value. If the change was
+        # unsuccessful, the next polling cycle will reset this to the actual
+        # value.
+        # TODO: Find a way to deal with the powersaving api
+        self.e3dc.set_powersave(enabled, True)
+
+    @e3dc_call
+    def set_weather_regulated_charge(self, enabled: bool) -> None:
+        """Set weather regulated charging flag."""
+        # The call would normally return the new state, however, various e3dc's
+        # react differently here, my E3DC does not work as the way e3dc lib is
+        # implemented, so so far we ignore the return value. If the change was
+        # unsuccessful, the next polling cycle will reset this to the actual
+        # value.
+        # TODO: Find a way to deal with the weather regulation api
+        self.e3dc.set_weather_regulated_charge(enabled, True)
+
+    @e3dc_call
+    def get_power_mode(self) -> int:
+        """Load the E3DC power mode."""
+        data = self.e3dc.sendRequestTag(RscpTag.EMS_REQ_MODE, keepAlive=True)
+        return data
+
+    @e3dc_call
+    def set_power_mode(self, mode: int = 0, value: int = 0) -> int:
+        """Set the E3DC power mode and value."""
+        data = self.e3dc.sendRequest(
+            (
+                RscpTag.EMS_REQ_SET_POWER,
+                RscpType.Container,
+                [
+                    (
+                        RscpTag.EMS_REQ_SET_POWER_MODE,
+                        RscpType.UChar8,
+                        mode if mode is not None else 0,
+                    ),
+                    (
+                        RscpTag.EMS_REQ_SET_POWER_VALUE,
+                        RscpType.Int32,
+                        value if value is not None else 0,
+                    ),
+                ],
+            ),
+            keepAlive=True,
+        )
+
+        return rscpFindTag(data, RscpTag.EMS_SET_POWER)[2]
+
+    @e3dc_call
+    def get_remote_control_ip(self, keepAlive: bool = False) -> str | None:
+        """Get the E3DC remote control IP."""
+        data = self.e3dc.sendRequestTag(
+            RscpTag.EMS_REQ_IP_REMOTE_CONTROL,
+            keepAlive=keepAlive,
+        )
+
+        return data if data != "" else None
+
+    @e3dc_call
+    def get_ip_address(self, keepAlive: bool = False) -> str:
+        """Get the E3DC IP address."""
+        data = self.e3dc.sendRequestTag(
+            RscpTag.INFO_REQ_IP_ADDRESS,
+            keepAlive=keepAlive,
+        )
+
+        return rscpFindTag(data, RscpTag.INFO_IP_ADDRESS)[2]

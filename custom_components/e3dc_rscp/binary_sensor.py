@@ -12,7 +12,7 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -22,7 +22,7 @@ from .coordinator import E3DCCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class E3DCBinarySensorEntityDescription(BinarySensorEntityDescription):
     """Derived helper for more advanced entity configs."""
 
@@ -31,24 +31,213 @@ class E3DCBinarySensorEntityDescription(BinarySensorEntityDescription):
 
 
 SENSOR_DESCRIPTIONS: Final[tuple[E3DCBinarySensorEntityDescription, ...]] = (
-    # CONFIG AND DIAGNOSTIC SENSORS
+    # DIAGNOSTIC SENSORS
     E3DCBinarySensorEntityDescription(
-        key="ext_source_available",
-        translation_key="ext_source_available",
+        key="system-additional-source-available",
+        translation_key="system-additional-source-available",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         on_icon="mdi:power-plug-outline",
         off_icon="mdi:power-plug-off-outline",
     ),
+    # DEVICE SENSORS
     E3DCBinarySensorEntityDescription(
-        key="pset_limits_enabled",
-        translation_key="pset_limits_enabled",
-        entity_category=EntityCategory.CONFIG,
+        key="pset-limit-enabled",
+        translation_key="pset-limit-enabled",
         device_class=BinarySensorDeviceClass.RUNNING,
         on_icon="mdi:signal",
         off_icon="mdi:signal-off",
     ),
-    # DEVICE SENSORS (none yet)
+    E3DCBinarySensorEntityDescription(
+        key="manual-charge-active",
+        translation_key="manual-charge-active",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:electric-switch-closed",
+        off_icon="mdi:electric-switch",
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="sgready-active",
+        translation_key="sgready-active",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:flash",
+        off_icon="mdi:flash-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    # SYSTEM STATUS SENSORS
+    # States of the energy management unit which are relevant during normal
+    # operation, therefore enabled by default.
+    E3DCBinarySensorEntityDescription(
+        key="system-emergency-power-started",
+        translation_key="system-emergency-power-started",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:home-lightning-bolt",
+        off_icon="mdi:home-lightning-bolt-outline",
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-emergency-reserve-reached",
+        translation_key="system-emergency-reserve-reached",
+        device_class=BinarySensorDeviceClass.BATTERY,
+        on_icon="mdi:battery-alert-variant-outline",
+        off_icon="mdi:battery-check-outline",
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-wait-for-weather-breakthrough",
+        translation_key="system-wait-for-weather-breakthrough",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:weather-partly-cloudy",
+        off_icon="mdi:weather-sunny",
+    ),
+    # SYSTEM STATUS DIAGNOSTIC SENSORS
+    # Remaining status flags of the energy management unit, they are of
+    # diagnostic nature and therefore disabled by default.
+    E3DCBinarySensorEntityDescription(
+        key="system-dcdc-alive",
+        translation_key="system-dcdc-alive",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        on_icon="mdi:current-dc",
+        off_icon="mdi:close-network-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-power-meter-alive",
+        translation_key="system-power-meter-alive",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        on_icon="mdi:meter-electric-outline",
+        off_icon="mdi:close-network-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-battery-module-alive",
+        translation_key="system-battery-module-alive",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        on_icon="mdi:battery",
+        off_icon="mdi:close-network-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-pv-module-alive",
+        translation_key="system-pv-module-alive",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        on_icon="mdi:solar-panel",
+        off_icon="mdi:close-network-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-ems-alive",
+        translation_key="system-ems-alive",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        on_icon="mdi:home-automation",
+        off_icon="mdi:close-network-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-wallbox-alive",
+        translation_key="system-wallbox-alive",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        on_icon="mdi:ev-station",
+        off_icon="mdi:close-network-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-server-connection-alive",
+        translation_key="system-server-connection-alive",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        on_icon="mdi:cloud-check-variant-outline",
+        off_icon="mdi:cloud-off-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-pv-inverter-inited",
+        translation_key="system-pv-inverter-inited",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:solar-power",
+        off_icon="mdi:solar-power-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-pv-derated",
+        translation_key="system-pv-derated",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        on_icon="mdi:solar-power-variant-outline",
+        off_icon="mdi:solar-power-variant",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-ac-mode-blocked",
+        translation_key="system-ac-mode-blocked",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        on_icon="mdi:power-plug-off",
+        off_icon="mdi:power-plug",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-configuration-checked",
+        translation_key="system-configuration-checked",
+        on_icon="mdi:clipboard-check-outline",
+        off_icon="mdi:clipboard-alert-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-emergency-power-override",
+        translation_key="system-emergency-power-override",
+        on_icon="mdi:hand-back-right",
+        off_icon="mdi:hand-back-right-off",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-rescue-battery-enabled",
+        translation_key="system-rescue-battery-enabled",
+        on_icon="mdi:battery-heart-variant",
+        off_icon="mdi:battery-heart-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-power-save-active",
+        translation_key="system-power-save-active",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:sleep",
+        off_icon="mdi:sleep-off",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-charge-idle-period-active",
+        translation_key="system-charge-idle-period-active",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:battery-clock",
+        off_icon="mdi:battery-clock-outline",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-discharge-idle-period-active",
+        translation_key="system-discharge-idle-period-active",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        on_icon="mdi:timer-sand",
+        off_icon="mdi:timer-sand-empty",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    E3DCBinarySensorEntityDescription(
+        key="system-soc-sync-requested",
+        translation_key="system-soc-sync-requested",
+        on_icon="mdi:sync-alert",
+        off_icon="mdi:sync",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
 )
 
 
@@ -62,31 +251,178 @@ async def async_setup_entry(
         E3DCBinarySensor(coordinator, description, entry.unique_id)
         for description in SENSOR_DESCRIPTIONS
     ]
+
+    for wallbox in coordinator.wallboxes:
+        # Get the UID & Key for the given wallbox
+        device_info = wallbox["deviceInfo"]
+        identifiers = device_info.get("identifiers")
+        if not identifiers:
+            _LOGGER.warning(
+                "Wallbox deviceInfo has no identifiers, skipping wallbox %s (key: %s)",
+                wallbox["index"],
+                wallbox["key"],
+            )
+            continue
+        unique_id = next(iter(identifiers))[1]
+        wallbox_key = wallbox["key"]
+
+        wallbox_sun_mode_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-sun-mode",
+            translation_key="wallbox-sun-mode",
+            on_icon="mdi:weather-sunny",
+            off_icon="mdi:weather-sunny-off",
+            device_class=None,
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator,
+                wallbox_sun_mode_description,
+                unique_id,
+                device_info,
+            )
+        )
+
+        wallbox_plug_lock_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-plug-lock",
+            translation_key="wallbox-plug-lock",
+            on_icon="mdi:lock-open",
+            off_icon="mdi:lock",
+            device_class=BinarySensorDeviceClass.LOCK,
+            entity_registry_enabled_default=False,  # Disabled per default as only Wallbox easy connect provides this state
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator,
+                wallbox_plug_lock_description,
+                unique_id,
+                device_info,
+            )
+        )
+
+        wallbox_plug_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-plug",
+            translation_key="wallbox-plug",
+            on_icon="mdi:power-plug",
+            off_icon="mdi:power-plug-off",
+            device_class=BinarySensorDeviceClass.PLUG,
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator, wallbox_plug_description, unique_id, device_info
+            )
+        )
+
+        wallbox_schuko_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-schuko",
+            translation_key="wallbox-schuko",
+            on_icon="mdi:power-plug-outline",
+            off_icon="mdi:power-plug-off-outline",
+            device_class=BinarySensorDeviceClass.POWER,
+            entity_registry_enabled_default=False,  # Disabled per default as only Wallbox multi connect I provides this feature
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator,
+                wallbox_schuko_description,
+                unique_id,
+                device_info,
+            )
+        )
+
+        wallbox_charging_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-charging",
+            translation_key="wallbox-charging",
+            on_icon="mdi:car-electric",
+            off_icon="mdi:car-electric-outline",
+            device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator,
+                wallbox_charging_description,
+                unique_id,
+                device_info,
+            )
+        )
+
+        wallbox_charging_canceled_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-charging-canceled",
+            translation_key="wallbox-charging-canceled",
+            on_icon="mdi:cancel",
+            off_icon="mdi:check-circle-outline",
+            device_class=None,
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator,
+                wallbox_charging_canceled_description,
+                unique_id,
+                device_info,
+            )
+        )
+
+        wallbox_battery_to_car_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-battery-to-car",
+            translation_key="wallbox-battery-to-car",
+            on_icon="mdi:battery-charging",
+            off_icon="mdi:battery-off",
+            device_class=None,
+            entity_registry_enabled_default=False,
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator,
+                wallbox_battery_to_car_description,
+                unique_id,
+                device_info,
+            )
+        )
+
+        wallbox_key_state_description = E3DCBinarySensorEntityDescription(
+            key=f"{wallbox_key}-key-state",
+            translation_key="wallbox-key-state",
+            on_icon="mdi:key-variant",
+            off_icon="mdi:key-remove",
+            device_class=BinarySensorDeviceClass.LOCK,
+            entity_registry_enabled_default=False,
+        )
+        entities.append(
+            E3DCBinarySensor(
+                coordinator,
+                wallbox_key_state_description,
+                unique_id,
+                device_info,
+            )
+        )
+
     async_add_entities(entities)
 
 
 class E3DCBinarySensor(CoordinatorEntity, BinarySensorEntity):
     """Custom E3DC Binary Sensor implementation."""
 
-    coordinator: E3DCCoordinator
-    entity_description: E3DCBinarySensorEntityDescription
     _attr_has_entity_name: bool = True
-    _custom_icons: bool = False
 
     def __init__(
         self,
         coordinator: E3DCCoordinator,
         description: E3DCBinarySensorEntityDescription,
         uid: str,
+        device_info: DeviceInfo | None = None,
     ) -> None:
         """Initialize the Sensor."""
         super().__init__(coordinator)
-        self.entity_description = description
+        self.coordinator: E3DCCoordinator = coordinator
+        self.entity_description: E3DCBinarySensorEntityDescription = description
         self._attr_unique_id = f"{uid}_{description.key}"
-        self._custom_icons = (
+        self._custom_icons: bool = (
             self.entity_description.on_icon is not None
             and self.entity_description.off_icon is not None
         )
+        if device_info is not None:
+            self._deviceInfo = device_info
+        else:
+            self._deviceInfo = self.coordinator.device_info()
 
     @property
     def is_on(self) -> bool | None:
@@ -105,4 +441,4 @@ class E3DCBinarySensor(CoordinatorEntity, BinarySensorEntity):
     @property
     def device_info(self) -> DeviceInfo:
         """Return the device information."""
-        return self.coordinator.device_info()
+        return self._deviceInfo

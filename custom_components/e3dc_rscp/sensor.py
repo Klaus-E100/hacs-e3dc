@@ -1,6 +1,10 @@
 """E3DC sensor platform."""
+
 import logging
-from typing import Final
+from dataclasses import dataclass, replace
+from typing import Any, Final
+
+from e3dc._rscpTags import PowermeterType
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -9,32 +13,119 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfEnergy, UnitOfPower
+from homeassistant.const import (
+    EntityCategory,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfFrequency,
+    UnitOfPower,
+    UnitOfRatio,
+    UnitOfTemperature,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import (
+    BATTERY_MODULE_RAW_SENSORS,
+    BATTERY_MODULE_CALCULATED_SENSORS,
+    BATTERY_PACK_RAW_SENSORS,
+    BATTERY_PACK_CALCULATED_SENSORS,
+    DOMAIN,
+)
 from .coordinator import E3DCCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
-    # CONFIG AND DIAGNOSTIC SENSORS
-    SensorEntityDescription(
-        key="derate_percent",
-        translation_key="derate_percent",
+
+@dataclass(frozen=True)
+class E3DCSensorEntityDescription(SensorEntityDescription):
+    """Class describing E3DC Sensor entities."""
+
+    icons: dict[str, str] = None
+
+
+def _db_energy_sensor(
+    key: str, icon: str, *, enabled_default: bool = True
+) -> E3DCSensorEntityDescription:
+    """Build a Wh TOTAL_INCREASING DB statistic sensor."""
+    return E3DCSensorEntityDescription(
+        key=key,
+        translation_key=key,
+        icon=icon,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_display_precision=2,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_registry_enabled_default=enabled_default,
+    )
+
+
+def _db_percent_sensor(key: str) -> E3DCSensorEntityDescription:
+    """Build a percent MEASUREMENT DB statistic sensor."""
+    return E3DCSensorEntityDescription(
+        key=key,
+        translation_key=key,
+        icon="mdi:cloud-percent-outline",
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+        suggested_display_precision=0,
+        device_class=SensorDeviceClass.POWER_FACTOR,
+        state_class=SensorStateClass.MEASUREMENT,
+    )
+
+
+def _db_span_sensors(prefix: str) -> tuple[E3DCSensorEntityDescription, ...]:
+    """Sensors for one DB timespan prefix (db-day / db-month / db-year)."""
+    return (
+        _db_percent_sensor(f"{prefix}-autarky"),
+        _db_energy_sensor(f"{prefix}-battery-charge", "mdi:battery-charging-outline"),
+        _db_energy_sensor(
+            f"{prefix}-battery-discharge", "mdi:battery-arrow-down-outline"
+        ),
+        _db_energy_sensor(
+            f"{prefix}-grid-consumption", "mdi:transmission-tower-export"
+        ),
+        _db_energy_sensor(f"{prefix}-house-consumption", "mdi:home-import-outline"),
+        _db_energy_sensor(f"{prefix}-grid-production", "mdi:transmission-tower-import"),
+        _db_energy_sensor(f"{prefix}-solar-production", "mdi:solar-power"),
+        _db_percent_sensor(f"{prefix}-selfconsumption"),
+        _db_energy_sensor(
+            f"{prefix}-pm0-production",
+            "mdi:meter-electric-outline",
+            enabled_default=False,
+        ),
+        _db_energy_sensor(
+            f"{prefix}-pm1-production",
+            "mdi:meter-electric-outline",
+            enabled_default=False,
+        ),
+        # Enabled in async_setup_entry when an additional source is present.
+        _db_energy_sensor(
+            f"{prefix}-additional-production",
+            "mdi:solar-power-variant-outline",
+            enabled_default=False,
+        ),
+    )
+
+
+SENSOR_DESCRIPTIONS: Final[tuple[E3DCSensorEntityDescription, ...]] = (
+    # DIAGNOSTIC SENSORS
+    E3DCSensorEntityDescription(
+        key="system-derate-percent",
+        translation_key="system-derate-percent",
         icon="mdi:transmission-tower-off",
         entity_category=EntityCategory.DIAGNOSTIC,
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         device_class=SensorDeviceClass.POWER_FACTOR,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="derate_power",
-        translation_key="derate_power",
+    E3DCSensorEntityDescription(
+        key="system-derate-power",
+        translation_key="system-derate-power",
         icon="mdi:transmission-tower-off",
         entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfPower.WATT,
@@ -42,11 +133,10 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         suggested_display_precision=1,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="installed_battery_capacity",
-        translation_key="installed_battery_capacity",
+    E3DCSensorEntityDescription(
+        key="system-battery-installed-capacity",
+        translation_key="system-battery-installed-capacity",
         icon="mdi:battery-high",
         entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
@@ -55,9 +145,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.ENERGY_STORAGE,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="installed_peak_power",
-        translation_key="installed_peak_power",
+    E3DCSensorEntityDescription(
+        key="system-battery-installed-peak",
+        translation_key="system-battery-installed-peak",
         icon="mdi:solar-power-variant",
         entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfPower.WATT,
@@ -66,9 +156,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="max_ac_power",
-        translation_key="max_ac_power",
+    E3DCSensorEntityDescription(
+        key="system-ac-maxpower",
+        translation_key="system-ac-maxpower",
         icon="mdi:solar-power-variant",
         entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfPower.WATT,
@@ -76,11 +166,10 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         suggested_display_precision=1,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="max_bat_charge_power",
-        translation_key="max_bat_charge_power",
+    E3DCSensorEntityDescription(
+        key="system-battery-charge-max",
+        translation_key="system-battery-charge-max",
         icon="mdi:battery-arrow-up-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfPower.WATT,
@@ -89,9 +178,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="max_bat_discharge_power",
-        translation_key="max_bat_discharge_power",
+    E3DCSensorEntityDescription(
+        key="system-battery-discharge-max",
+        translation_key="system-battery-discharge-max",
         icon="mdi:battery-arrow-down-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfPower.WATT,
@@ -100,38 +189,16 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="mac_address",
-        translation_key="mac_address",
+    E3DCSensorEntityDescription(
+        key="system-mac",
+        translation_key="system-mac",
         icon="mdi:ethernet",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="pset_limits_charge_max",
-        translation_key="pset_limits_charge_max",
-        icon="mdi:battery-arrow-up-outline",
-        entity_category=EntityCategory.CONFIG,
-        native_unit_of_measurement=UnitOfPower.WATT,
-        suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
-        suggested_display_precision=1,
-        device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-    ),
-    SensorEntityDescription(
-        key="pset_limits_discharge_max",
-        translation_key="pset_limits_discharge_max",
-        icon="mdi:battery-arrow-down-outline",
-        entity_category=EntityCategory.CONFIG,
-        native_unit_of_measurement=UnitOfPower.WATT,
-        suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
-        suggested_display_precision=1,
-        device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-    ),
-    SensorEntityDescription(
-        key="pset_limits_discharge_start",
-        translation_key="pset_limits_discharge_start",
+    E3DCSensorEntityDescription(
+        key="pset-limit-discharge-minimum",
+        translation_key="pset-limit-discharge-minimum",
         icon="mdi:battery-arrow-down-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfPower.WATT,
@@ -139,13 +206,12 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         suggested_display_precision=0,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="start_discharge_default",
-        translation_key="start_discharge_default",
+    E3DCSensorEntityDescription(
+        key="system-battery-discharge-minimum-default",
+        translation_key="system-battery-discharge-minimum-default",
         icon="mdi:battery-arrow-down-outline",
-        entity_category=EntityCategory.CONFIG,
+        entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.WATT,
         suggested_display_precision=0,
@@ -154,18 +220,18 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         entity_registry_enabled_default=False,
     ),
     # DEVICE SENSORS
-    SensorEntityDescription(
+    E3DCSensorEntityDescription(
         key="autarky",
         translation_key="autarky",
         icon="mdi:home-percent-outline",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         suggested_display_precision=0,
         device_class=SensorDeviceClass.POWER_FACTOR,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="charge_battery",
-        translation_key="charge_battery",
+    E3DCSensorEntityDescription(
+        key="battery-charge",
+        translation_key="battery-charge",
         icon="mdi:battery-charging-outline",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -173,9 +239,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="consumption_battery",
-        translation_key="consumption_battery",
+    E3DCSensorEntityDescription(
+        key="battery-netchange",
+        translation_key="battery-netchange",
         icon="mdi:battery-charging",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -184,9 +250,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="consumption_grid",
-        translation_key="consumption_grid",
+    E3DCSensorEntityDescription(
+        key="grid-consumption",
+        translation_key="grid-consumption",
         icon="mdi:transmission-tower-export",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -194,9 +260,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="consumption_house",
-        translation_key="consumption_house",
+    E3DCSensorEntityDescription(
+        key="house-consumption",
+        translation_key="house-consumption",
         icon="mdi:home-import-outline",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -204,20 +270,130 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="consumption_wallbox",
-        translation_key="consumption_wallbox",
-        icon="mdi:ev-station",
-        native_unit_of_measurement=UnitOfPower.WATT,
-        suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
+    # Per-phase power. House is calculated as inverter + grid + additional
+    # powermeters, so its three phases add up to house-consumption.
+    *(
+        E3DCSensorEntityDescription(
+            key=f"{source}-{phase}",
+            translation_key=f"{source}-{phase}",
+            icon=icon,
+            native_unit_of_measurement=UnitOfPower.WATT,
+            suggested_display_precision=0,
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        for source, icon in (
+            ("house", "mdi:sine-wave"),
+            ("grid", "mdi:transmission-tower"),
+            ("pvi", "mdi:solar-power"),
+        )
+        for phase in ("l1", "l2", "l3")
+    ),
+    # Grid phase voltages from the root powermeter (PM_VOLTAGE_L1–L3).
+    *(
+        E3DCSensorEntityDescription(
+            key=f"grid-voltage-{phase}",
+            translation_key=f"grid-voltage-{phase}",
+            icon="mdi:sine-wave",
+            native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+            suggested_display_precision=1,
+            device_class=SensorDeviceClass.VOLTAGE,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        for phase in ("l1", "l2", "l3")
+    ),
+    # Inverter AC voltage/current per phase.
+    *(
+        E3DCSensorEntityDescription(
+            key=f"pvi-voltage-{phase}",
+            translation_key=f"pvi-voltage-{phase}",
+            icon="mdi:sine-wave",
+            native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+            suggested_display_precision=1,
+            device_class=SensorDeviceClass.VOLTAGE,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        for phase in ("l1", "l2", "l3")
+    ),
+    *(
+        E3DCSensorEntityDescription(
+            key=f"pvi-current-{phase}",
+            translation_key=f"pvi-current-{phase}",
+            icon="mdi:current-ac",
+            native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+            suggested_display_precision=2,
+            device_class=SensorDeviceClass.CURRENT,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        for phase in ("l1", "l2", "l3")
+    ),
+    # Root powermeter energy per phase (signed net energy → TOTAL).
+    *(
+        E3DCSensorEntityDescription(
+            key=f"grid-energy-{phase}",
+            translation_key=f"grid-energy-{phase}",
+            icon="mdi:transmission-tower",
+            native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            suggested_display_precision=2,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL,
+        )
+        for phase in ("l1", "l2", "l3")
+    ),
+    E3DCSensorEntityDescription(
+        key="pvi-frequency",
+        translation_key="pvi-frequency",
+        icon="mdi:sine-wave",
+        native_unit_of_measurement=UnitOfFrequency.HERTZ,
         suggested_display_precision=2,
-        device_class=SensorDeviceClass.POWER,
+        device_class=SensorDeviceClass.FREQUENCY,
         state_class=SensorStateClass.MEASUREMENT,
+    ),
+    E3DCSensorEntityDescription(
+        key="pvi-system-mode",
+        translation_key="pvi-system-mode",
+        icon="mdi:cog-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="delta_grid",
-        translation_key="delta_grid",
+    E3DCSensorEntityDescription(
+        key="pvi-power-mode",
+        translation_key="pvi-power-mode",
+        icon="mdi:lightning-bolt-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    E3DCSensorEntityDescription(
+        key="emergency-power-status",
+        translation_key="emergency-power-status",
+        icon="mdi:home-lightning-bolt-outline",
+        device_class=SensorDeviceClass.ENUM,
+        options=[
+            "not_supported",
+            "active",
+            "not_active",
+            "not_available",
+            "motor_switch_wrong_position",
+        ],
+        icons={
+            "not_supported": "mdi:home-lightning-bolt-outline",
+            "active": "mdi:home-lightning-bolt",
+            "not_active": "mdi:home-lightning-bolt-outline",
+            "not_available": "mdi:home-alert-outline",
+            "motor_switch_wrong_position": "mdi:electric-switch",
+        },
+    ),
+    E3DCSensorEntityDescription(
+        key="emergency-power-numeric-status",
+        translation_key="emergency-power-numeric-status",
+        icon="mdi:numeric",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    E3DCSensorEntityDescription(
+        key="grid-netchange",
+        translation_key="grid-netchange",
         icon="mdi:battery-charging",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -226,9 +402,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="discharge_battery",
-        translation_key="discharge_battery",
+    E3DCSensorEntityDescription(
+        key="battery-discharge",
+        translation_key="battery-discharge",
         icon="mdi:battery-arrow-down-outline",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -236,9 +412,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="production_add",
-        translation_key="production_add",
+    E3DCSensorEntityDescription(
+        key="additional-production",
+        translation_key="additional-production",
         icon="mdi:power-plug",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -247,9 +423,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_registry_enabled_default=False,
     ),
-    SensorEntityDescription(
-        key="production_grid",
-        translation_key="production_grid",
+    E3DCSensorEntityDescription(
+        key="grid-production",
+        translation_key="grid-production",
         icon="mdi:transmission-tower-import",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -257,9 +433,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
-        key="production_solar",
-        translation_key="production_solar",
+    E3DCSensorEntityDescription(
+        key="solar-production",
+        translation_key="solar-production",
         icon="mdi:solar-power",
         native_unit_of_measurement=UnitOfPower.WATT,
         suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -267,24 +443,517 @@ SENSOR_DESCRIPTIONS: Final[tuple[SensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
+    E3DCSensorEntityDescription(
         key="selfconsumption",
         translation_key="selfconsumption",
         icon="mdi:cloud-percent-outline",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         suggested_display_precision=0,
         device_class=SensorDeviceClass.POWER_FACTOR,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    SensorEntityDescription(
+    E3DCSensorEntityDescription(
         key="soc",
         translation_key="soc",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         suggested_display_precision=0,
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
     ),
+    E3DCSensorEntityDescription(
+        key="manual-charge-energy",
+        translation_key="manual-charge-energy",
+        icon="mdi:transmission-tower",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_display_precision=2,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    E3DCSensorEntityDescription(
+        key="pset-limit-charge",
+        translation_key="pset-limit-charge",
+        icon="mdi:battery-arrow-up-outline",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
+        suggested_display_precision=1,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    E3DCSensorEntityDescription(
+        key="pset-limit-discharge",
+        translation_key="pset-limit-discharge",
+        icon="mdi:battery-arrow-down-outline",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
+        suggested_display_precision=1,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    # LONGTERM STATISTIC SENSORS
+    *_db_span_sensors("db-day"),
+    *_db_span_sensors("db-month"),
+    *_db_span_sensors("db-year"),
+    E3DCSensorEntityDescription(
+        key="power-mode",
+        translation_key="power-mode",
+        icons={
+            "IDLE": "mdi:battery-off-outline",
+            "DISCHARGE": "mdi:battery-arrow-down-outline",
+            "CHARGE": "mdi:battery-arrow-up-outline",
+        },
+        icon="mdi:battery-unknown",
+    ),
+    E3DCSensorEntityDescription(
+        key="set-power-mode",
+        translation_key="pset-powermode",
+        icon="mdi:flash",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=True,
+    ),
+    E3DCSensorEntityDescription(
+        key="set-power-value",
+        translation_key="pset-powervalue",
+        icon="mdi:meter-electric",
+        name="Max Charge Power",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement="W",
+        entity_registry_enabled_default=True,
+    ),
 )
+
+BATTERY_SENSOR_DESCRIPTION_TEMPLATES: dict[str, dict[str, Any]] = {
+    "current": {
+        "translation_key": "battery-module-current",
+        "icon": "mdi:current-dc",
+        "native_unit_of_measurement": UnitOfElectricCurrent.AMPERE,
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "current-avg-30s": {
+        "translation_key": "battery-module-current-avg-30s",
+        "icon": "mdi:current-dc",
+        "native_unit_of_measurement": UnitOfElectricCurrent.AMPERE,
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "cycle-count": {
+        "translation_key": "battery-module-cycle-count",
+        "icon": "mdi:counter",
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "design-capacity": {
+        "translation_key": "battery-module-design-capacity",
+        "icon": "mdi:battery-outline",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "design-voltage": {
+        "translation_key": "battery-module-design-voltage",
+        "icon": "mdi:flash-outline",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "end-of-discharge": {
+        "translation_key": "battery-module-end-of-discharge",
+        "icon": "mdi:battery-arrow-down-outline",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "error": {
+        "translation_key": "battery-module-error",
+        "icon": "mdi:alert-circle",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "full-charge-capacity": {
+        "translation_key": "battery-module-full-charge-capacity",
+        "icon": "mdi:battery-charging",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "max-charge-current": {
+        "translation_key": "battery-module-max-charge-current",
+        "icon": "mdi:current-ac",
+        "native_unit_of_measurement": UnitOfElectricCurrent.AMPERE,
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "max-charge-temperature": {
+        "translation_key": "battery-module-max-charge-temperature",
+        "icon": "mdi:thermometer-high",
+        "native_unit_of_measurement": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "max-charge-voltage": {
+        "translation_key": "battery-module-max-charge-voltage",
+        "icon": "mdi:flash",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "max-discharge-current": {
+        "translation_key": "battery-module-max-discharge-current",
+        "icon": "mdi:current-ac",
+        "native_unit_of_measurement": UnitOfElectricCurrent.AMPERE,
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "min-charge-temperature": {
+        "translation_key": "battery-module-min-charge-temperature",
+        "icon": "mdi:thermometer-low",
+        "native_unit_of_measurement": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "parallel-cell-count": {
+        "translation_key": "battery-module-parallel-cell-count",
+        "icon": "mdi:sitemap",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "sensor-count": {
+        "translation_key": "battery-module-sensor-count",
+        "icon": "mdi:counter",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "series-cell-count": {
+        "translation_key": "battery-module-series-cell-count",
+        "icon": "mdi:layers",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "remaining-capacity": {
+        "translation_key": "battery-module-remaining-capacity",
+        "icon": "mdi:battery-high",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "soc": {
+        "translation_key": "battery-module-soc",
+        "icon": "mdi:battery-charging-80",
+        "native_unit_of_measurement": UnitOfRatio.PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 0,
+    },
+    "soh": {
+        "translation_key": "battery-module-soh",
+        "icon": "mdi:battery-heart",
+        "native_unit_of_measurement": UnitOfRatio.PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "suggested_display_precision": 0,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "soh-reported": {
+        "translation_key": "battery-module-soh-reported",
+        "icon": "mdi:battery-heart-outline",
+        "native_unit_of_measurement": UnitOfRatio.PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "suggested_display_precision": 0,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "status": {
+        "translation_key": "battery-module-status",
+        "icon": "mdi:information-outline",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "voltage": {
+        "translation_key": "battery-module-voltage",
+        "icon": "mdi:flash",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "voltage-avg-30s": {
+        "translation_key": "battery-module-voltage-avg-30s",
+        "icon": "mdi:flash",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "warning": {
+        "translation_key": "battery-module-warning",
+        "icon": "mdi:alert-outline",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "manufacture-date": {
+        "translation_key": "battery-module-manufacture-date",
+        "icon": "mdi:calendar",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+}
+
+BATTERY_PACK_SENSOR_DESCRIPTION_TEMPLATES: dict[str, dict[str, Any]] = {
+    "asoc": {
+        "translation_key": "battery-pack-asoc",
+        "icon": "mdi:battery",
+        "native_unit_of_measurement": UnitOfRatio.PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "suggested_display_precision": 0,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "charge-cycles": {
+        "translation_key": "battery-pack-charge-cycles",
+        "icon": "mdi:counter",
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "current": {
+        "translation_key": "battery-pack-current",
+        "icon": "mdi:current-dc",
+        "native_unit_of_measurement": UnitOfElectricCurrent.AMPERE,
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "design-capacity": {
+        "translation_key": "battery-pack-design-capacity",
+        "icon": "mdi:battery-outline",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "device-connected": {
+        "translation_key": "battery-pack-device-connected",
+        "icon": "mdi:power-plug",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "device-in-service": {
+        "translation_key": "battery-pack-device-in-service",
+        "icon": "mdi:progress-wrench",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "device-working": {
+        "translation_key": "battery-pack-device-working",
+        "icon": "mdi:check-circle",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "design-energy": {
+        "translation_key": "battery-pack-design-energy",
+        "icon": "mdi:battery-outline",
+        "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+        "device_class": SensorDeviceClass.ENERGY_STORAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "eod-voltage": {
+        "translation_key": "battery-pack-eod-voltage",
+        "icon": "mdi:battery-arrow-down-outline",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "error-code": {
+        "translation_key": "battery-pack-error-code",
+        "icon": "mdi:alert-circle",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "full-charge-capacity": {
+        "translation_key": "battery-pack-full-charge-capacity",
+        "icon": "mdi:battery-charging",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "full-energy": {
+        "translation_key": "battery-pack-full-energy",
+        "icon": "mdi:battery-charging-100",
+        "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+        "device_class": SensorDeviceClass.ENERGY_STORAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "max-battery-voltage": {
+        "translation_key": "battery-pack-max-battery-voltage",
+        "icon": "mdi:flash",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "max-charge-current": {
+        "translation_key": "battery-pack-max-charge-current",
+        "icon": "mdi:current-ac",
+        "native_unit_of_measurement": UnitOfElectricCurrent.AMPERE,
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "max-discharge-current": {
+        "translation_key": "battery-pack-max-discharge-current",
+        "icon": "mdi:current-ac",
+        "native_unit_of_measurement": UnitOfElectricCurrent.AMPERE,
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "max-dcb-cell-temperature": {
+        "translation_key": "battery-pack-max-dcb-cell-temperature",
+        "icon": "mdi:thermometer-high",
+        "native_unit_of_measurement": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "min-dcb-cell-temperature": {
+        "translation_key": "battery-pack-min-dcb-cell-temperature",
+        "icon": "mdi:thermometer-low",
+        "native_unit_of_measurement": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "module-voltage": {
+        "translation_key": "battery-pack-module-voltage",
+        "icon": "mdi:flash",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "remaining-capacity": {
+        "translation_key": "battery-pack-remaining-capacity",
+        "icon": "mdi:battery-high",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "remaining-energy": {
+        "translation_key": "battery-pack-remaining-energy",
+        "icon": "mdi:battery-high",
+        "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+        "device_class": SensorDeviceClass.ENERGY_STORAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "ready-for-shutdown": {
+        "translation_key": "battery-pack-ready-for-shutdown",
+        "icon": "mdi:power-standby",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "rsoc": {
+        "translation_key": "battery-pack-rsoc",
+        "icon": "mdi:battery",
+        "native_unit_of_measurement": UnitOfRatio.PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "rsoc-real": {
+        "translation_key": "battery-pack-rsoc-real",
+        "icon": "mdi:battery",
+        "native_unit_of_measurement": UnitOfRatio.PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "status-code": {
+        "translation_key": "battery-pack-status-code",
+        "icon": "mdi:information-outline",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "terminal-voltage": {
+        "translation_key": "battery-pack-terminal-voltage",
+        "icon": "mdi:flash",
+        "native_unit_of_measurement": UnitOfElectricPotential.VOLT,
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+    "total-use-time": {
+        "translation_key": "battery-pack-total-use-time",
+        "icon": "mdi:clock-outline",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "total-discharge-time": {
+        "translation_key": "battery-pack-total-discharge-time",
+        "icon": "mdi:clock-outline",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "training-mode": {
+        "translation_key": "battery-pack-training-mode",
+        "icon": "mdi:account-school",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "usable-capacity": {
+        "translation_key": "battery-pack-usable-capacity",
+        "icon": "mdi:battery",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "usable-remaining-capacity": {
+        "translation_key": "battery-pack-usable-remaining-capacity",
+        "icon": "mdi:battery",
+        "native_unit_of_measurement": "Ah",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "usable-remaining-energy": {
+        "translation_key": "battery-pack-usable-remaining-energy",
+        "icon": "mdi:battery-check",
+        "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+        "device_class": SensorDeviceClass.ENERGY_STORAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 2,
+    },
+    "state-of-health": {
+        "translation_key": "battery-pack-state-of-health",
+        "icon": "mdi:heart-pulse",
+        "native_unit_of_measurement": UnitOfRatio.PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "suggested_display_precision": 1,
+    },
+}
 
 
 async def async_setup_entry(
@@ -293,30 +962,501 @@ async def async_setup_entry(
     """Initialize Sensor Platform."""
     assert isinstance(entry.unique_id, str)
     coordinator: E3DCCoordinator = hass.data[DOMAIN][entry.unique_id]
-    entities: list[E3DCSensor] = [
-        E3DCSensor(coordinator, description, entry.unique_id)
-        for description in SENSOR_DESCRIPTIONS
-    ]
+    additional_production_available = coordinator.additional_production_available
+    entities: list[E3DCSensor] = []
+    for description in SENSOR_DESCRIPTIONS:
+        # Enable the aggregated additional-production sensor only when an
+        # external source is present (see issue #43). Keep it disabled by
+        # default otherwise so installs without an extra inverter stay clean.
+        # Same for DB day/month/year additional-production energy totals (#145).
+        if description.key in (
+            "additional-production",
+            "db-day-additional-production",
+            "db-month-additional-production",
+            "db-year-additional-production",
+        ):
+            description = replace(
+                description,
+                entity_registry_enabled_default=additional_production_available,
+            )
+        entities.append(E3DCSensor(coordinator, description, entry.unique_id))
+
+    # Add SG Ready sensors if SG Ready is enabled
+    if coordinator.sgready_available:
+        sgready_state_description = E3DCSensorEntityDescription(
+            key="sgready-state",
+            translation_key="sgready-state",
+            icon="mdi:heat-pump",
+            device_class=SensorDeviceClass.ENUM,
+            options=["locked", "normal", "released", "start_up"],
+        )
+        entities.append(
+            E3DCSensor(coordinator, sgready_state_description, entry.unique_id)
+        )
+
+        sgready_numeric_description = E3DCSensorEntityDescription(
+            key="sgready-numeric-state",
+            translation_key="sgready-numeric-state",
+            icon="mdi:heat-pump",
+            entity_registry_enabled_default=False,
+        )
+        entities.append(
+            E3DCSensor(coordinator, sgready_numeric_description, entry.unique_id)
+        )
+
+    # Add Sensor descriptions for additional powermeters, skip root PM
+    for powermeter_config in coordinator.proxy.e3dc_config["powermeters"]:
+        if powermeter_config["type"] == PowermeterType.PM_TYPE_ROOT.value:
+            continue
+
+        energy_description = E3DCSensorEntityDescription(
+            has_entity_name=True,
+            name=powermeter_config["name"] + " - total",
+            key=powermeter_config["key"] + "-total",
+            translation_key=powermeter_config["key"] + "-total",
+            icon="mdi:meter-electric",
+            native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            suggested_display_precision=2,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=powermeter_config["total-state-class"],
+        )
+        entities.append(E3DCSensor(coordinator, energy_description, entry.unique_id))
+
+        power_description = E3DCSensorEntityDescription(
+            has_entity_name=True,
+            name=powermeter_config["name"],
+            key=powermeter_config["key"],
+            translation_key=powermeter_config["key"],
+            icon="mdi:meter-electric",
+            native_unit_of_measurement=UnitOfPower.WATT,
+            suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
+            suggested_display_precision=1,
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        entities.append(E3DCSensor(coordinator, power_description, entry.unique_id))
+
+        for phase in ("l1", "l2", "l3"):
+            phase_energy_description = E3DCSensorEntityDescription(
+                has_entity_name=True,
+                name=f"{powermeter_config['name']} L{phase[-1]} energy",
+                key=f"{powermeter_config['key']}-energy-{phase}",
+                icon="mdi:meter-electric",
+                native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+                suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                suggested_display_precision=2,
+                device_class=SensorDeviceClass.ENERGY,
+                state_class=powermeter_config["total-state-class"],
+            )
+            entities.append(
+                E3DCSensor(coordinator, phase_energy_description, entry.unique_id)
+            )
+
+    # PVI temperature sensors (count discovered at connect).
+    for temp_num in range(1, coordinator.pvi_temperature_count + 1):
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                E3DCSensorEntityDescription(
+                    key=f"pvi-temperature-{temp_num}",
+                    translation_key="pvi-temperature",
+                    translation_placeholders={"sensor": str(temp_num)},
+                    icon="mdi:thermometer",
+                    native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+                    suggested_display_precision=1,
+                    device_class=SensorDeviceClass.TEMPERATURE,
+                    state_class=SensorStateClass.MEASUREMENT,
+                ),
+                entry.unique_id,
+            )
+        )
+
+    # Per-string PV DC metrics (MPP trackers) from the first PVI.
+    for string_num in range(1, coordinator.proxy.pvi_string_count() + 1):
+        prefix = f"pvi-string-{string_num}"
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                E3DCSensorEntityDescription(
+                    key=f"{prefix}-power",
+                    translation_key="pvi-string-power",
+                    translation_placeholders={"string": str(string_num)},
+                    icon="mdi:solar-power",
+                    native_unit_of_measurement=UnitOfPower.WATT,
+                    suggested_display_precision=0,
+                    device_class=SensorDeviceClass.POWER,
+                    state_class=SensorStateClass.MEASUREMENT,
+                ),
+                entry.unique_id,
+            )
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                E3DCSensorEntityDescription(
+                    key=f"{prefix}-voltage",
+                    translation_key="pvi-string-voltage",
+                    translation_placeholders={"string": str(string_num)},
+                    icon="mdi:sine-wave",
+                    native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+                    suggested_display_precision=1,
+                    device_class=SensorDeviceClass.VOLTAGE,
+                    state_class=SensorStateClass.MEASUREMENT,
+                ),
+                entry.unique_id,
+            )
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                E3DCSensorEntityDescription(
+                    key=f"{prefix}-current",
+                    translation_key="pvi-string-current",
+                    translation_placeholders={"string": str(string_num)},
+                    icon="mdi:current-dc",
+                    native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+                    suggested_display_precision=2,
+                    device_class=SensorDeviceClass.CURRENT,
+                    state_class=SensorStateClass.MEASUREMENT,
+                ),
+                entry.unique_id,
+            )
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                E3DCSensorEntityDescription(
+                    key=f"{prefix}-energy",
+                    translation_key="pvi-string-energy",
+                    translation_placeholders={"string": str(string_num)},
+                    icon="mdi:solar-power-variant",
+                    native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+                    suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                    suggested_display_precision=2,
+                    device_class=SensorDeviceClass.ENERGY,
+                    state_class=SensorStateClass.TOTAL_INCREASING,
+                ),
+                entry.unique_id,
+            )
+        )
+
+    # Create battery pack sensors first, before module sensors
+    # This ensures pack devices are registered before modules reference them via via_device_id
+    if coordinator.create_battery_devices:
+        for pack in coordinator.battery_packs:
+            pack_unique_id = pack.get("uniqueId", entry.unique_id)
+            pack_device_info = pack.get("deviceInfo")
+
+            # Add raw sensors
+            for _, slug in BATTERY_PACK_RAW_SENSORS:
+                template = BATTERY_PACK_SENSOR_DESCRIPTION_TEMPLATES.get(slug)
+                if template is None:
+                    continue
+
+                description = E3DCSensorEntityDescription(
+                    has_entity_name=True,
+                    key=f"{pack['key']}-{slug}",
+                    **template,
+                )
+                entities.append(
+                    E3DCSensor(
+                        coordinator,
+                        description,
+                        pack_unique_id,
+                        pack_device_info,
+                    )
+                )
+
+            # Add calculated sensors
+            for slug in BATTERY_PACK_CALCULATED_SENSORS:
+                template = BATTERY_PACK_SENSOR_DESCRIPTION_TEMPLATES.get(slug)
+                if template is None:
+                    continue
+
+                description = E3DCSensorEntityDescription(
+                    has_entity_name=True,
+                    key=f"{pack['key']}-{slug}",
+                    **template,
+                )
+                entities.append(
+                    E3DCSensor(
+                        coordinator,
+                        description,
+                        pack_unique_id,
+                        pack_device_info,
+                    )
+                )
+
+    # Create battery module sensors after pack sensors
+    # This ensures pack devices exist before modules reference them via via_device_id
+    for battery in coordinator.batteries:
+        unique_id = list(battery["deviceInfo"]["identifiers"])[0][1]
+        battery_key = battery["key"]
+
+        # Create raw sensors
+        for _, slug in BATTERY_MODULE_RAW_SENSORS:
+            # Skip soh-reported sensor if device doesn't provide it
+            if slug == "soh-reported" and not battery.get(
+                "hasDeviceReportedSoh", False
+            ):
+                continue
+
+            template = BATTERY_SENSOR_DESCRIPTION_TEMPLATES.get(slug)
+            if template is None:
+                continue
+
+            description = E3DCSensorEntityDescription(
+                has_entity_name=True,
+                key=f"{battery_key}-{slug}",
+                **template,
+            )
+            entities.append(
+                E3DCSensor(
+                    coordinator,
+                    description,
+                    unique_id,
+                    battery["deviceInfo"],
+                )
+            )
+
+        # Create calculated sensors
+        for slug in BATTERY_MODULE_CALCULATED_SENSORS:
+            template = BATTERY_SENSOR_DESCRIPTION_TEMPLATES.get(slug)
+            if template is None:
+                continue
+
+            description = E3DCSensorEntityDescription(
+                has_entity_name=True,
+                key=f"{battery_key}-{slug}",
+                **template,
+            )
+            entities.append(
+                E3DCSensor(
+                    coordinator,
+                    description,
+                    unique_id,
+                    battery["deviceInfo"],
+                )
+            )
+
+    for wallbox in coordinator.wallboxes:
+        # Get the UID & Key for the given wallbox
+        unique_id = list(wallbox["deviceInfo"]["identifiers"])[0][1]
+        wallbox_key = wallbox["key"]
+
+        wallbox_app_software_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-app-software",
+            translation_key="wallbox-app-software",
+            icon="mdi:information-outline",
+            device_class=None,
+            entity_registry_enabled_default=False,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_app_software_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_consumption_net_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-consumption-net",
+            translation_key="wallbox-consumption-net",
+            icon="mdi:transmission-tower-import",
+            native_unit_of_measurement=UnitOfPower.WATT,
+            suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_consumption_net_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_consumption_sun_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-consumption-sun",
+            translation_key="wallbox-consumption-sun",
+            icon="mdi:solar-power",
+            native_unit_of_measurement=UnitOfPower.WATT,
+            suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_consumption_sun_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_energy_all_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-energy-all",
+            translation_key="wallbox-energy-all",
+            icon="mdi:counter",
+            native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            suggested_display_precision=2,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL_INCREASING,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_energy_all_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_energy_net_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-energy-net",
+            translation_key="wallbox-energy-net",
+            icon="mdi:counter",
+            native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            suggested_display_precision=2,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL_INCREASING,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_energy_net_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_energy_sun_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-energy-sun",
+            translation_key="wallbox-energy-sun",
+            icon="mdi:counter",
+            native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            suggested_display_precision=2,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL_INCREASING,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_energy_sun_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_index_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-index",
+            translation_key="wallbox-index",
+            icon="mdi:numeric",
+            device_class=None,
+            entity_registry_enabled_default=False,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator, wallbox_index_description, unique_id, wallbox["deviceInfo"]
+            )
+        )
+
+        wallbox_max_charge_current_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-max-charge-current",
+            translation_key="wallbox-max-charge-current",
+            icon="mdi:current-ac",
+            native_unit_of_measurement="A",
+            device_class=SensorDeviceClass.CURRENT,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_max_charge_current_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_phases_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-phases",
+            translation_key="wallbox-phases",
+            icon="mdi:sine-wave",
+            device_class=None,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator,
+                wallbox_phases_description,
+                unique_id,
+                wallbox["deviceInfo"],
+            )
+        )
+
+        wallbox_soc_description = E3DCSensorEntityDescription(
+            key=f"{wallbox_key}-soc",
+            translation_key="wallbox-soc",
+            icon="mdi:battery-charging",
+            native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+            suggested_display_precision=0,
+            device_class=SensorDeviceClass.BATTERY,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_registry_enabled_default=False,
+        )
+        entities.append(
+            E3DCSensor(
+                coordinator, wallbox_soc_description, unique_id, wallbox["deviceInfo"]
+            )
+        )
+
+    if len(coordinator.wallboxes) > 0:
+        wallbox_consumption_description = E3DCSensorEntityDescription(
+            key="wallbox-consumption",
+            translation_key="wallbox-consumption",
+            icon="mdi:ev-station",
+            native_unit_of_measurement=UnitOfPower.WATT,
+            suggested_unit_of_measurement=UnitOfPower.KILO_WATT,
+            suggested_display_precision=2,
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        entities.append(
+            E3DCSensor(coordinator, wallbox_consumption_description, entry.unique_id)
+        )
+
     async_add_entities(entities)
 
 
 class E3DCSensor(CoordinatorEntity, SensorEntity):
     """Custom E3DC Sensor implementation."""
 
-    coordinator: E3DCCoordinator
-    entity_description: SensorEntityDescription
     _attr_has_entity_name = True
 
     def __init__(
         self,
         coordinator: E3DCCoordinator,
-        description: SensorEntityDescription,
+        description: E3DCSensorEntityDescription,
         uid: str,
+        device_info: DeviceInfo | None = None,
     ) -> None:
         """Initialize the Sensor."""
         super().__init__(coordinator)
-        self.entity_description = description
+        self.coordinator: E3DCCoordinator = coordinator
+        self.entity_description: E3DCSensorEntityDescription = description
         self._attr_unique_id = f"{uid}_{description.key}"
+        self._has_custom_icons: bool = self.entity_description.icons is not None
+        if device_info is not None:
+            self._deviceInfo = device_info
+        else:
+            self._deviceInfo = self.coordinator.device_info()
 
     @property
     def native_value(self) -> StateType:
@@ -324,6 +1464,21 @@ class E3DCSensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.data.get(self.entity_description.key)
 
     @property
+    def icon(self) -> str | None:
+        """Return the icon for the sensor."""
+        return (
+            self.get_icon() if self._has_custom_icons else self.entity_description.icon
+        )
+
+    @property
     def device_info(self) -> DeviceInfo:
         """Return the device information."""
-        return self.coordinator.device_info()
+        return self._deviceInfo
+
+    def get_icon(self) -> str | None:
+        """Return the icon for the sensor."""
+        value: str = self.coordinator.data.get(self.entity_description.key)
+        if self.entity_description.icons.get(value) is not None:
+            return self.entity_description.icons.get(value)
+
+        return None

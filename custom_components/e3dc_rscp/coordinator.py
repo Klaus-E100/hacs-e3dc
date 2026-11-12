@@ -1,85 +1,436 @@
 """Coordinator for E3DC integration."""
 
-from datetime import timedelta
+from datetime import timedelta, datetime
 import logging
-from typing import Any
+from time import time
+from typing import Any, Final, TypedDict, cast
+import pytz
+import re
 
-from e3dc import E3DC  # Missing Exports:; SendError,
+from e3dc._rscpTags import PowermeterType
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.core import HomeAssistant, callback, Event
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util.dt import as_timestamp, start_of_local_day
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import (  # CoordinatorEntity,; UpdateFailed,
-    DataUpdateCoordinator,
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.components.sensor import SensorStateClass
+from homeassistant.util.event_type import EventType
+
+from homeassistant.const import (
+    CONF_PASSWORD,
+    CONF_USERNAME,
 )
 
-from .const import CONF_RSCPKEY, DOMAIN
+from custom_components.e3dc_rscp.utils import (
+    initialize_farm_controller_flow_if_needed,
+    async_register_device,
+)
+
+from .const import (
+    CONF_RSCPKEY,
+    CONF_CREATE_BATTERY_DEVICES,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_CREATE_BATTERY_DEVICES,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    MAX_SCAN_INTERVAL,
+    MAX_WALLBOXES_POSSIBLE,
+    MIN_SCAN_INTERVAL,
+    PowerMode,
+    SetPowerMode,
+)
+
+from .e3dc_proxy import E3DCProxy
+from .battery_manager import E3DCBatteryManager, E3DCBattery, E3DCBatteryPack
 
 _LOGGER = logging.getLogger(__name__)
+_STAT_REFRESH_INTERVAL = 60
+
+# Maps the system status flags as delivered by get_system_status() onto our
+# coordinator data keys. All of them are booleans describing the current state of
+# the E3/DC energy management unit.
+_SYSTEM_STATUS_FLAGS: Final[dict[str, str]] = {
+    "acModeBlocked": "system-ac-mode-blocked",
+    "batteryModuleAlive": "system-battery-module-alive",
+    "chargeIdlePeriodActive": "system-charge-idle-period-active",
+    "dcdcAlive": "system-dcdc-alive",
+    "dischargeIdlePeriodActive": "system-discharge-idle-period-active",
+    "emergencyPowerOverride": "system-emergency-power-override",
+    "emergencyPowerStarted": "system-emergency-power-started",
+    "emergencyReserveReached": "system-emergency-reserve-reached",
+    "emsAlive": "system-ems-alive",
+    "powerMeterAlive": "system-power-meter-alive",
+    "powerSaveEnabled": "system-power-save-active",
+    "pvDerated": "system-pv-derated",
+    "pvInverterInited": "system-pv-inverter-inited",
+    "pvModuleAlive": "system-pv-module-alive",
+    "rescueBatteryEnabled": "system-rescue-battery-enabled",
+    "serverConnectionAlive": "system-server-connection-alive",
+    "socSyncRequested": "system-soc-sync-requested",
+    "sysConfChecked": "system-configuration-checked",
+    "waitForWeatherBreakthrough": "system-wait-for-weather-breakthrough",
+    "wallBoxAlive": "system-wallbox-alive",
+}
+
+# EMS_EMERGENCY_POWER_STATUS / Modbus register 40084
+_EMERGENCY_POWER_STATUS_MAP: Final[dict[int, str]] = {
+    0: "not_supported",
+    1: "active",
+    2: "not_active",
+    3: "not_available",
+    4: "motor_switch_wrong_position",
+}
+
+
+class E3DCWallbox(TypedDict):
+    """E3DC Wallbox, keeps general information, attributes and identity data for an individual wallbox."""
+
+    index: int
+    key: str
+    deviceInfo: DeviceInfo
+    lowerCurrentLimit: int
+    upperCurrentLimit: int
 
 
 class E3DCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """E3DC Coordinator, fetches all relevant data and provides proxies for all service calls."""
 
-    e3dc: E3DC = None
-    _mydata: dict[str, Any] = {}
-    _sw_version: str = ""
-    _update_guard_powersettings: bool = False
-
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry) -> None:
         """Initialize E3DC Coordinator and connect."""
-        self.host: str | None = config_entry.data.get(CONF_HOST)
-        self.username: str | None = config_entry.data.get(CONF_USERNAME)
-        self.password: str | None = config_entry.data.get(CONF_PASSWORD)
-        self.rscpkey: str | None = config_entry.data.get(CONF_RSCPKEY)
         assert isinstance(config_entry.unique_id, str)
         self.uid: str = config_entry.unique_id
+        self.proxy = E3DCProxy(hass, config_entry)
+        self._mydata: dict[str, Any] = {}
+        self._sw_version: str = ""
+        self._update_guard_powersettings: bool = False
+        self._update_guard_wallboxsettings: bool = False
+        self.config_entry: ConfigEntry = config_entry
+        self._wallboxes: list[E3DCWallbox] = []
+        self._sgready_available: bool = False
+        self._timezone_offset: int = 0
+        self._next_stat_update: float = 0
+        self._pvi_temperature_count: int = 0
+        self._isFarmController: bool = config_entry.data.get("farmcontroller", False)
+        self._hub_device_id: str | None = None
+
+        # Initialize battery manager
+        self.battery_manager = E3DCBatteryManager(
+            hass=hass,
+            uid=self.uid,
+            proxy=self.proxy,
+            mydata=self._mydata,
+            config_entry_id=config_entry.entry_id,
+            hub_device_id_callback=lambda: self.hub_device_id,
+            create_battery_devices_callback=lambda: self.config_entry.options.get(
+                CONF_CREATE_BATTERY_DEVICES, DEFAULT_CREATE_BATTERY_DEVICES
+            ),
+        )
+
+        self._stop_set_power_mode = None
+        hass.bus.async_listen_once(
+            EventType("homeassistant_stop"), self._shutdown_power_mode
+        )
+
+        self._mydata["set-power-mode"] = SetPowerMode.NORMAL.value
+        self._mydata["set-power-value"] = None
+
+        scan_interval = int(
+            config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        )
+        scan_interval = max(MIN_SCAN_INTERVAL, min(MAX_SCAN_INTERVAL, scan_interval))
 
         super().__init__(
-            hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=10)
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=scan_interval),
         )
 
-    async def async_connect(self):
+    async def async_connect(self) -> None:
         """Establish connection to E3DC."""
-        try:
-            self.e3dc: E3DC = await self.hass.async_add_executor_job(
-                create_e3dcinstance,
-                self.username,
-                self.password,
-                self.host,
-                self.rscpkey,
-            )
-        except Exception as ex:
-            raise ConfigEntryAuthFailed from ex
 
-        self._mydata["derate_percent"] = self.e3dc.deratePercent
-        self._mydata["derate_power"] = self.e3dc.deratePower
-        self._mydata["ext_source_available"] = self.e3dc.externalSourceAvailable != 0
-        self._mydata["installed_battery_capacity"] = self.e3dc.installedBatteryCapacity
-        self._mydata["installed_peak_power"] = self.e3dc.installedPeakPower
-        self._mydata["max_ac_power"] = self.e3dc.maxAcPower
-        self._mydata["max_bat_charge_power"] = self.e3dc.maxBatChargePower
-        self._mydata["max_bat_discharge_power"] = self.e3dc.maxBatDischargePower
-        self._mydata["mac_address"] = self.e3dc.macAddress
-        self._mydata["model"] = self.e3dc.model
-        self._mydata["start_discharge_default"] = self.e3dc.startDischargeDefault
+        # TODO: Beautify this, make the code flow with the connects/disconnects more natural.
+        # Have a call to autoconf, then connect with it.
+        await self.hass.async_add_executor_job(self.proxy.connect)
+        await self._async_connect_additional_powermeters()
+        self._pvi_temperature_count = await self.hass.async_add_executor_job(
+            self.proxy.get_pvi_temperature_count
+        )
+
+        self._mydata["system-derate-percent"] = self.proxy.e3dc.deratePercent
+        self._mydata["system-derate-power"] = self.proxy.e3dc.deratePower
+        self._mydata["system-additional-source-available"] = (
+            self.proxy.e3dc.externalSourceAvailable != 0
+        )
+        self._mydata["system-battery-installed-capacity"] = (
+            self.proxy.e3dc.installedBatteryCapacity
+        )
+        self._mydata["system-battery-installed-peak"] = (
+            self.proxy.e3dc.installedPeakPower
+        )
+        self._mydata["system-ac-maxpower"] = self.proxy.e3dc.maxAcPower
+        self._mydata["system-battery-charge-max"] = self.proxy.e3dc.maxBatChargePower
+        self._mydata["system-battery-discharge-max"] = (
+            self.proxy.e3dc.maxBatDischargePower
+        )
+        self._mydata["system-mac"] = self.proxy.e3dc.macAddress
+        self._mydata["model"] = self.proxy.e3dc.model
+        self._mydata["system-battery-discharge-minimum-default"] = (
+            self.proxy.e3dc.startDischargeDefault
+        )
 
         # Idea: Maybe Port this to e3dc lib, it can query this in one go during startup.
-        self._sw_version = await self._async_e3dc_request_single_tag(
-            "INFO_REQ_SW_RELEASE"
+        self._sw_version = await self.hass.async_add_executor_job(
+            self.proxy.get_software_version
         )
 
-    async def _async_e3dc_request_single_tag(self, tag: str) -> Any:
-        """Send a single tag request to E3DC, wraps lib call for async usage, supplies defaults."""
-
-        # Signature for reference: Tag, Retries, Keepalive
-        result = await self.hass.async_add_executor_job(
-            self.e3dc.sendRequestTag, tag, 3, True
+        # Register the hub device explicitly so its registry id is available
+        # for via_device_id links on child devices (wallboxes, battery
+        # packs/modules) created during identification below.
+        self._hub_device_id = async_register_device(
+            self.hass,
+            self.config_entry.entry_id,
+            cast(dict[str, Any], self.device_info()),
         )
-        return result
+
+        await self._load_timezone_settings()
+
+    async def async_identify_farm(self, hass: HomeAssistant) -> None:
+        """Identify if device is part of a farm and initiate farm controller configuration if so."""
+
+        await initialize_farm_controller_flow_if_needed(
+            hass,
+            self.proxy,
+            self.config_entry.data.get(CONF_USERNAME, None),
+            self.config_entry.data.get(CONF_PASSWORD, None),
+            self.config_entry.data.get(CONF_RSCPKEY, None),
+        )
+
+    async def async_identify_wallboxes(self, hass: HomeAssistant) -> None:
+        """Identify availability of Wallboxes if get_wallbox_identification_data() returns meaningful data."""
+        if self._isFarmController:
+            """Farm Controller does not support wallboxes. They are handled by child."""
+            return
+
+        for wallbox_index in range(0, MAX_WALLBOXES_POSSIBLE - 1):
+            try:
+                request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                    self.proxy.get_wallbox_identification_data, wallbox_index
+                )
+            except HomeAssistantError as ex:
+                _LOGGER.warning(
+                    "Failed to load wallbox with index %s, not updating data: %s",
+                    wallbox_index,
+                    ex,
+                )
+                return
+
+            if "macAddress" in request_data:
+                _LOGGER.debug("Wallbox with index %s has been found", wallbox_index)
+
+                unique_id = dr.format_mac(request_data["macAddress"])
+                wallboxType = request_data["wallboxType"]
+                model = f"Wallbox Type {wallboxType}"
+
+                raw_device_info: dict[str, Any] = {
+                    "identifiers": {(DOMAIN, unique_id)},
+                    "manufacturer": "E3DC",
+                    "name": request_data["deviceName"],
+                    "model": model,
+                    "sw_version": request_data["firmwareVersion"],
+                    "serial_number": request_data["wallboxSerial"],
+                    "connections": {
+                        (
+                            dr.CONNECTION_NETWORK_MAC,
+                            dr.format_mac(request_data["macAddress"]),
+                        )
+                    },
+                    "configuration_url": "https://my.e3dc.com/",
+                }
+                assert isinstance(self.hub_device_id, str)
+                raw_device_info["via_device_id"] = self.hub_device_id
+                deviceInfo = cast(DeviceInfo, raw_device_info)
+
+                wallbox: E3DCWallbox = {
+                    "index": wallbox_index,
+                    "key": unique_id,
+                    "deviceInfo": deviceInfo,
+                    "lowerCurrentLimit": request_data["lowerCurrentLimit"],
+                    "upperCurrentLimit": request_data["upperCurrentLimit"],
+                }
+                self.wallboxes.append(wallbox)
+            else:
+                _LOGGER.debug("No Wallbox with index %s has been found", wallbox_index)
+
+    async def async_identify_sgready(self) -> None:
+        """Identify availability of SG Ready support."""
+        try:
+            request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_sgready_state
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning(
+                "Failed to identify SG Ready capability, assuming disabled: %s", ex
+            )
+            self._sgready_available = False
+            return
+
+        self._sgready_available = bool(request_data.get("sgready-active"))
+        if self._sgready_available:
+            _LOGGER.debug("SG Ready support detected")
+        else:
+            _LOGGER.debug("SG Ready support not active")
+
+    @property
+    def hub_device_id(self) -> str | None:
+        """Return the device registry id of the main E3DC hub device."""
+        return self._hub_device_id
+
+    # Getter for _wallboxes
+    @property
+    def wallboxes(self) -> list[E3DCWallbox]:
+        """Get the list of wallboxes."""
+        return self._wallboxes
+
+    @property
+    def sgready_available(self) -> bool:
+        """Return if SG Ready information is available."""
+        return self._sgready_available
+
+    @property
+    def pvi_temperature_count(self) -> int:
+        """Return the number of PVI temperature sensors on the first inverter."""
+        return self._pvi_temperature_count
+
+    @property
+    def create_battery_devices(self) -> bool:
+        """Flag indicating if battery devices should be created."""
+        return self.battery_manager.create_battery_devices
+
+    @property
+    def batteries(self) -> list[E3DCBattery]:
+        """Get the list of identified battery modules."""
+        return self.battery_manager.batteries
+
+    @property
+    def battery_packs(self) -> list[E3DCBatteryPack]:
+        """Get the list of battery packs for the configured batteries."""
+        return self.battery_manager.battery_packs
+
+    @property
+    def additional_production_available(self) -> bool:
+        """Return True if an additional production source is present.
+
+        Used to enable the aggregated ``additional-production`` sensor by
+        default when an external inverter / additional source exists. Checks
+        both the E3DC ``externalSourceAvailable`` flag and concrete powermeter
+        types discovered at connect time.
+        """
+        if self._mydata.get("system-additional-source-available"):
+            return True
+
+        for powermeter in self.proxy.e3dc_config.get("powermeters", []):
+            if powermeter["type"] in (
+                PowermeterType.PM_TYPE_ADDITIONAL_PRODUCTION.value,
+                PowermeterType.PM_TYPE_ADDITIONAL.value,
+            ):
+                return True
+        return False
+
+    async def async_identify_batteries(self, hass: HomeAssistant) -> None:
+        """Identify installed battery modules if enabled via options (delegates to battery manager)."""
+        await self.battery_manager.async_identify_batteries()
+
+    # Setter for individual wallbox values
+    def setWallboxValue(self, index: int, key: str, value: Any) -> None:
+        """Set the value for a specific key in a wallbox identified by its index."""
+        for wallbox in self._wallboxes:
+            if wallbox["index"] == index:
+                wallbox[key] = value
+                _LOGGER.debug(f"Set {key} to {value} for wallbox with index {index}")
+                return
+        raise ValueError(f"Wallbox with index {index} not found")
+
+    # Getter for individual wallbox values
+    def getWallboxValue(self, index: int, key: str) -> Any:
+        """Get the value for a specific key in a wallbox identified by its index."""
+        for wallbox in self._wallboxes:
+            if wallbox["index"] == index:
+                value = wallbox.get(key)
+                if value is not None:
+                    _LOGGER.debug(
+                        f"Got {key} value {value} for wallbox with index {index}"
+                    )
+                    return value
+                else:
+                    raise KeyError(f"Key {key} not found in wallbox with index {index}")
+        raise ValueError(f"Wallbox with index {index} not found")
+
+    async def _async_connect_additional_powermeters(self) -> None:
+        """Identify the installed powermeters and reconnect to E3DC with this config."""
+        # TODO: Restructure config so that we are indexed by powemeter ID.
+        self.proxy.e3dc_config["powermeters"] = await self.hass.async_add_executor_job(
+            self.proxy.get_powermeters
+        )
+        # Keep discovered PVIs (incl. corrected max string count, see #413)
+        # across reconnect, otherwise pye3dc falls back to [{"index": 0}]
+        # without a "strings" key.
+        self.proxy.e3dc_config["pvis"] = await self.hass.async_add_executor_job(
+            self.proxy.get_pvis
+        )
+
+        for powermeter in self.proxy.e3dc_config["powermeters"]:
+            if powermeter["type"] == PowermeterType.PM_TYPE_ROOT.value:
+                powermeter["name"] = "Root PM"
+                powermeter["key"] = "root-pm"
+                powermeter["total-state-class"] = SensorStateClass.TOTAL
+                powermeter["negate-measure"] = False
+
+            else:
+                powermeter["name"] = (
+                    powermeter["typeName"]
+                    .replace("PM_TYPE_", "")
+                    .replace("_", " ")
+                    .capitalize()
+                )
+                powermeter["key"] = (
+                    powermeter["typeName"]
+                    .replace("PM_TYPE_", "")
+                    .replace("_", "-")
+                    .lower()
+                    + "-"
+                    + str(powermeter["index"])
+                )
+
+                match powermeter["type"]:
+                    case (
+                        PowermeterType.PM_TYPE_ADDITIONAL_PRODUCTION.value
+                        | PowermeterType.PM_TYPE_ADDITIONAL.value
+                    ):
+                        powermeter["total-state-class"] = (
+                            SensorStateClass.TOTAL_INCREASING
+                        )
+                        powermeter["negate-measure"] = True
+
+                    case PowermeterType.PM_TYPE_ADDITIONAL_CONSUMPTION.value:
+                        powermeter["total-state-class"] = (
+                            SensorStateClass.TOTAL_INCREASING
+                        )
+                        powermeter["negate-measure"] = False
+
+                    case _:
+                        powermeter["total-state-class"] = SensorStateClass.TOTAL
+                        powermeter["negate-measure"] = False
+
+        await self.hass.async_add_executor_job(self.proxy.disconnect)
+        await self.hass.async_add_executor_job(
+            self.proxy.connect,
+            self.proxy.e3dc_config,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Update all data required by our entities in one go."""
@@ -88,129 +439,645 @@ class E3DCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # connect did already retrieve all static values.
 
         _LOGGER.debug("Polling general status information")
-        poll_data: dict[str, Any] = await self.hass.async_add_executor_job(
-            self.e3dc.poll, True
-        )
-        self._process_poll(poll_data)
+        await self._load_and_process_poll()
 
+        _LOGGER.debug("Polling system status information")
+        await self._load_and_process_system_status()
+
+        _LOGGER.debug("Polling emergency power status")
+        await self._load_and_process_emergency_power_status()
+
+        # TODO: Check if we need to replace this with a safe IPC sync
         if self._update_guard_powersettings is False:
             _LOGGER.debug("Poll power settings")
-            power_settings: dict[
-                str, Any | None
-            ] = await self.hass.async_add_executor_job(
-                self.e3dc.get_power_settings, True
-            )
-            self._process_power_settings(power_settings)
+            await self._load_and_process_power_settings()
         else:
             _LOGGER.debug("Not polling powersettings, they are updating right now")
 
+        _LOGGER.debug("Polling manual charge information")
+        await self._load_and_process_manual_charge()
+
+        _LOGGER.debug("Getting SG Ready status information")
+        await self._load_and_process_sgready_state()
+
+        _LOGGER.debug("Polling additional powermeters")
+        await self._load_and_process_powermeters_data()
+
+        _LOGGER.debug("Polling PVI string data")
+        await self._load_and_process_pvi_strings_data()
+
+        if self._update_guard_wallboxsettings is False:
+            if self.wallboxes:
+                _LOGGER.debug("Polling wallbox")
+                await self._load_and_process_wallbox_data()
+            else:
+                _LOGGER.debug("Skipping wallbox poll, no wallboxes configured")
+        else:
+            _LOGGER.debug("Not polling wallbox, they are updating right now")
+
+        if self.create_battery_devices:
+            _LOGGER.debug("Polling battery data")
+            await self.battery_manager.async_load_and_process_battery_data()
+
+        # Only poll power statstics once per minute. E3DC updates it only once per 15
+        # minutes anyway, this should be a good compromise to get the metrics shortly
+        # before the end of the day.
+        if self._next_stat_update < time():
+            _LOGGER.debug("Polling DB power metrics (day/month/year)")
+            await self._load_and_process_db_data_today()
+            await self._load_and_process_db_data_timespan("MONTH", "db-month")
+            await self._load_and_process_db_data_timespan("YEAR", "db-year")
+            self._next_stat_update = time() + _STAT_REFRESH_INTERVAL
+            # TODO: Reduce interval further, but take start_ts into account to get an
+            # end of day reading of the metric.
+        else:
+            _LOGGER.debug("Skipping power metrics poll.")
+
         return self._mydata
 
-    def _process_power_settings(self, power_settings: dict[str, Any | None]):
-        """Process retrieved power settings."""
-        self._mydata["pset_limits_charge_max"] = power_settings["maxChargePower"]
-        self._mydata["pset_limits_discharge_max"] = power_settings["maxDischargePower"]
-        self._mydata["pset_limits_discharge_start"] = power_settings[
+    async def _load_and_process_power_settings(self) -> None:
+        """Load and process power settings."""
+        try:
+            power_settings: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_power_settings
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed to load power settings, not updating data: %s", ex)
+            return
+
+        self._mydata["pset-limit-charge"] = power_settings["maxChargePower"]
+        self._mydata["pset-limit-discharge"] = power_settings["maxDischargePower"]
+        self._mydata["pset-limit-discharge-minimum"] = power_settings[
             "dischargeStartPower"
         ]
-        self._mydata["pset_limits_enabled"] = power_settings["powerLimitsUsed"]
-        self._mydata["pset_powersave_enabled"] = power_settings["powerSaveEnabled"]
-        self._mydata["pset_weatherregulation_enabled"] = power_settings[
+        self._mydata["pset-limit-enabled"] = power_settings["powerLimitsUsed"]
+        self._mydata["pset-powersaving-enabled"] = power_settings["powerSaveEnabled"]
+        self._mydata["pset-weatherregulationenabled"] = power_settings[
             "weatherRegulatedChargeEnabled"
         ]
 
-    def _process_poll(self, poll_data: dict[str, Any]):
+    async def _load_and_process_system_status(self) -> None:
+        """Load and process E3DC system status flags."""
+        try:
+            system_status: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_system_status
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed to load system status, not updating data: %s", ex)
+            return
+
+        for flag, key in _SYSTEM_STATUS_FLAGS.items():
+            if flag not in system_status:
+                _LOGGER.debug(
+                    "System status did not include %s, keeping previous state", flag
+                )
+                continue
+
+            self._mydata[key] = bool(system_status[flag])
+
+    async def _load_and_process_poll(self) -> None:
+        """Load and process standard poll data."""
+        try:
+            poll_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.poll
+            )
+            power_mode_job = self.hass.async_add_executor_job(self.proxy.get_power_mode)
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed to poll, not updating data: %s", ex)
+            return
+
+        self._mydata["additional-production"] = poll_data["production"]["add"]
         self._mydata["autarky"] = poll_data["autarky"]
-        self._mydata["charge_battery"] = max(0, poll_data["consumption"]["battery"])
-        self._mydata["consumption_battery"] = poll_data["consumption"]["battery"]
-        self._mydata["consumption_grid"] = max(0, poll_data["production"]["grid"])
-        self._mydata["consumption_house"] = poll_data["consumption"]["house"]
-        self._mydata["consumption_wallbox"] = poll_data["consumption"]["wallbox"]
-        self._mydata["delta_grid"] = poll_data["production"]["grid"]
-        self._mydata["discharge_battery"] = (
+        self._mydata["battery-charge"] = max(0, poll_data["consumption"]["battery"])
+        self._mydata["battery-discharge"] = (
             min(0, poll_data["consumption"]["battery"]) * -1
         )
-        self._mydata["production_add"] = poll_data["production"]["add"]
-        self._mydata["production_grid"] = min(0, poll_data["production"]["grid"]) * -1
-        self._mydata["production_solar"] = poll_data["production"]["solar"]
+        self._mydata["battery-netchange"] = poll_data["consumption"]["battery"]
+        self._mydata["grid-consumption"] = max(0, poll_data["production"]["grid"])
+        self._mydata["grid-netchange"] = poll_data["production"]["grid"]
+        self._mydata["grid-production"] = min(0, poll_data["production"]["grid"]) * -1
+        self._mydata["house-consumption"] = poll_data["consumption"]["house"]
         self._mydata["selfconsumption"] = poll_data["selfConsumption"]
         self._mydata["soc"] = poll_data["stateOfCharge"]
+        self._mydata["solar-production"] = poll_data["production"]["solar"]
+        self._mydata["wallbox-consumption"] = poll_data["consumption"]["wallbox"]
+
+        power_mode: str = str(await power_mode_job)
+        if PowerMode.has_value(power_mode):
+            self._mydata["power-mode"] = power_mode
+        else:
+            _LOGGER.debug("Unknown power mode %s", power_mode)
+            self._mydata["power-mode"] = f"Power mode {power_mode}"
+
+    def _apply_db_data(self, prefix: str, db_data: dict[str, Any]) -> None:
+        """Map E3DC DB statistics into coordinator data under the given prefix."""
+        self._mydata[f"{prefix}-autarky"] = db_data["autarky"]
+        self._mydata[f"{prefix}-battery-charge"] = db_data["bat_power_in"]
+        self._mydata[f"{prefix}-battery-discharge"] = db_data["bat_power_out"]
+        self._mydata[f"{prefix}-grid-consumption"] = db_data["grid_power_out"]
+        self._mydata[f"{prefix}-grid-production"] = db_data["grid_power_in"]
+        self._mydata[f"{prefix}-house-consumption"] = db_data["consumption"]
+        self._mydata[f"{prefix}-selfconsumption"] = db_data["consumed_production"]
+        self._mydata[f"{prefix}-solar-production"] = db_data["solarProduction"]
+
+        # Powermeter production can be signed depending on meter orientation.
+        pm0 = abs(float(db_data.get("pm0Production") or 0))
+        pm1 = abs(float(db_data.get("pm1Production") or 0))
+        self._mydata[f"{prefix}-pm0-production"] = pm0
+        self._mydata[f"{prefix}-pm1-production"] = pm1
+        self._mydata[f"{prefix}-additional-production"] = pm0 + pm1
+
+    async def _load_and_process_db_data_today(self) -> None:
+        """Load and process retrieved db data settings."""
+        try:
+            db_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_db_data, self._get_db_data_day_timestamp(), 86400
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed to load daily stats, not updating data: %s", ex)
+            return
+
+        self._apply_db_data("db-day", db_data)
+        self._mydata["db-day-startts"] = db_data["startTimestamp"]
+
+    async def _load_and_process_db_data_timespan(
+        self, timespan: str, prefix: str
+    ) -> None:
+        """Load and process DB statistics for MONTH or YEAR."""
+        try:
+            db_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_db_data_timespan, timespan
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning(
+                "Failed to load %s stats, not updating data: %s", timespan.lower(), ex
+            )
+            return
+
+        if not db_data:
+            _LOGGER.debug("Empty %s DB stats response, keeping previous data", timespan)
+            return
+
+        self._apply_db_data(prefix, db_data)
+
+    async def _load_and_process_manual_charge(self) -> None:
+        """Loand and process manual charge status."""
+        try:
+            request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_manual_charge
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning(
+                "Failed to load manual charge state, not updating data: %s", ex
+            )
+            return
+
+        self._mydata["manual-charge-active"] = request_data["active"]
+        self._mydata["manual-charge-energy"] = request_data["energy"]
+
+    async def _load_and_process_powermeters_data(self) -> None:
+        """Load and process additional sources to existing data."""
+        try:
+            request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_powermeters_data
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed to load powermeters, not updating data: %s", ex)
+            return
+
+        for key, value in request_data.items():
+            self._mydata[key] = value
+
+    async def _load_and_process_pvi_strings_data(self) -> None:
+        """Load and process per-string PV DC metrics."""
+        try:
+            request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_pvi_strings_data
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed to load PVI string data, not updating data: %s", ex)
+            return
+
+        for key, value in request_data.items():
+            self._mydata[key] = value
+
+    async def _load_and_process_emergency_power_status(self) -> None:
+        """Load and process detailed EMS emergency power status."""
+        try:
+            request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_emergency_power_status
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning(
+                "Failed to load emergency power status, not updating data: %s", ex
+            )
+            return
+
+        raw_status = request_data["emergency-power-status"]
+        try:
+            status_code = int(raw_status)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "Unknown emergency power status %s, keeping previous state", raw_status
+            )
+            return
+
+        mapped_status = _EMERGENCY_POWER_STATUS_MAP.get(status_code)
+        if mapped_status is None:
+            # ENUM sensor rejects unknown options; keep previous mapped state.
+            _LOGGER.warning(
+                "Unknown emergency power status %s, keeping previous state",
+                status_code,
+            )
+        else:
+            self._mydata["emergency-power-status"] = mapped_status
+        self._mydata["emergency-power-numeric-status"] = status_code
+
+    async def _load_and_process_sgready_state(self) -> None:
+        """Loand and process SG Ready state."""
+        try:
+            request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_sgready_state
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed to load SG Ready state, not updating data: %s", ex)
+            return
+
+        sgready_state_map = {
+            1: "locked",
+            2: "normal",
+            3: "released",
+            4: "start_up",
+        }
+        raw_state = request_data["sgready-state"]
+        mapped_state = sgready_state_map.get(raw_state)
+        if mapped_state is None:
+            # The sensor is an ENUM sensor, values outside of its options list
+            # would be rejected by HA, so keep the previous state instead.
+            _LOGGER.warning(
+                "Unknown SG Ready state %s, keeping previous state", raw_state
+            )
+        else:
+            self._mydata["sgready-state"] = mapped_state
+        self._mydata["sgready-numeric-state"] = request_data["sgready-numeric-state"]
+        self._mydata["sgready-active"] = bool(request_data["sgready-active"])
+        self._sgready_available = bool(request_data["sgready-active"])
+
+    async def _load_and_process_wallbox_ems_settings(self) -> None:
+        """Load and process EMS-level wallbox settings.
+
+        These are independent of the per-wallbox readings, so a failure here
+        (e.g. firmware without support for these RSCP tags) must not prevent
+        the regular wallbox polling.
+        """
+        try:
+            ems_wb_state: dict[str, Any] = await self.hass.async_add_executor_job(
+                self.proxy.get_wallbox_ems_settings
+            )
+        except HomeAssistantError as ex:
+            _LOGGER.warning(
+                "Failed to load EMS wallbox settings, not updating them: %s", ex
+            )
+            return
+
+        self._mydata["battery-before-car-mode"] = ems_wb_state[
+            "battery-before-car-mode"
+        ]
+        self._mydata["battery-to-car-mode"] = ems_wb_state["battery-to-car-mode"]
+        self._mydata["battery-wallbox-discharge-limit"] = ems_wb_state[
+            "battery-wallbox-discharge-limit"
+        ]
+        self._mydata["wallbox-enforce-power-assignment"] = ems_wb_state[
+            "wallbox-enforce-power-assignment"
+        ]
+
+    async def _load_and_process_wallbox_data(self) -> None:
+        """Load and process wallbox data to existing data."""
+        await self._load_and_process_wallbox_ems_settings()
+
+        for wallbox in self.wallboxes:
+            try:
+                request_data: dict[str, Any] = await self.hass.async_add_executor_job(
+                    self.proxy.get_wallbox_data, wallbox["index"]
+                )
+            except HomeAssistantError as ex:
+                _LOGGER.warning(
+                    "Failed to load wallbox %s, not updating its data: %s",
+                    wallbox["index"],
+                    ex,
+                )
+                continue
+
+            for key, value in request_data.items():
+                formatted_key = re.sub(
+                    r"(?<!^)(?=[A-Z])", "-", key
+                ).lower()  # RegEx to convert from CamelCase to kebab-case
+                if formatted_key == "plug-locked":
+                    formatted_key = "plug-lock"
+                    value = (
+                        not value
+                    )  # Inverse to match HA's Lock On/Off interpretation
+                if formatted_key == "plugged":
+                    formatted_key = "plug"
+                if formatted_key == "schuko-on":
+                    formatted_key = "schuko"
+                if formatted_key == "sun-mode-on":
+                    formatted_key = "sun-mode"
+                if formatted_key == "charging-active":
+                    formatted_key = "charging"
+                wallbox_key = wallbox["key"]
+                self._mydata[f"{wallbox_key}-{formatted_key}"] = value
+
+    async def _load_timezone_settings(self) -> None:
+        """Load the current timezone offset from the E3DC, using its local timezone data.
+
+        Required to correctly retrieve power statistics for today.
+        """
+        tz_name: str = await self.hass.async_add_executor_job(self.proxy.get_timezone)
+
+        tz_offset: int | None = None
+        try:
+            tz_info: pytz.timezone = await self.hass.async_add_executor_job(
+                pytz.timezone, tz_name
+            )
+            dt_tmp: datetime = datetime.now(tz_info)
+            tz_offset = dt_tmp.utcoffset().seconds
+        except pytz.UnknownTimeZoneError:
+            _LOGGER.exception(
+                "Failed to load timezone from E3DC, falling back to heuristics."
+            )
+
+        if tz_offset is None:
+            # Fallback to compute the offset using current times from E3DC:
+            ts_local: int = await self.hass.async_add_executor_job(self.proxy.get_time)
+            ts_utc: int = await self.hass.async_add_executor_job(self.proxy.get_timeutc)
+            delta: int = ts_local - ts_utc
+            tz_offset = int(1800 * round(delta / 1800))
+
+        self._mydata["e3dc_timezone"] = tz_name
+        self._timezone_offset = tz_offset
+
+    def _get_db_data_day_timestamp(self) -> int:
+        """Get the local start-of-day timestamp for DB Query, needs some tweaking."""
+        today: datetime = start_of_local_day()
+        today_ts: int = int(as_timestamp(today))
+        _LOGGER.debug(
+            "Midnight is %s, DB query timestamp is %s, applied offset: %s",
+            today,
+            today_ts,
+            self._timezone_offset,
+        )
+        # tz_hass: pytz.timezone = pytz.timezone("Europe/Berlin")
+        # today: datetime = datetime.now(tz_hass).replace(hour=0, minute=0, second=0, microsecond=0)
+        # today_ts: int = today.timestamp()
+        # Move to local time, the Timestamp needed by the E3DC DB queries are
+        # not in UTC as they should be.
+        today_ts += self._timezone_offset
+        return today_ts
 
     def device_info(self) -> DeviceInfo:
         """Return default device info structure."""
         return DeviceInfo(
             manufacturer="E3DC",
-            model=self.e3dc.model,
-            name=self.e3dc.model,
-            connections={(dr.CONNECTION_NETWORK_MAC, self.e3dc.macAddress)},
+            model=self.proxy.e3dc.model
+            + (self._isFarmController and " Farm Controller" or ""),
+            name=self.proxy.e3dc.model
+            + (self._isFarmController and " Farm Controller" or ""),
+            serial_number=self.proxy.e3dc.serialNumber,
+            connections=(
+                {(dr.CONNECTION_NETWORK_MAC, self.proxy.e3dc.macAddress)}
+                if not self._isFarmController
+                else None
+            ),
             identifiers={(DOMAIN, self.uid)},
             sw_version=self._sw_version,
-            configuration_url="https://s10.e3dc.com/",
+            configuration_url="https://my.e3dc.com/",
         )
 
     async def async_set_weather_regulated_charge(self, enabled: bool) -> bool:
         """Enable or disable weather regulated charging."""
-
-        _LOGGER.debug("Updating weather regulated charging to %s", enabled)
-
-        self._update_guard_powersettings = True
-        self._mydata["pset_weatherregulation_enabled"] = enabled
+        _LOGGER.debug("Updating weather regulated chargsing to %s", enabled)
 
         try:
-            new_value: bool = await self.hass.async_add_executor_job(
-                self.e3dc.set_weather_regulated_charge, enabled, True
+            self._update_guard_powersettings = True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_weather_regulated_charge, enabled
             )
-        except:
-            _LOGGER.exception(
-                "Failed to update weather regulated charging to %s", enabled
-            )
-            # Once we have better exception handling available, we need to throw
-            # proper HomeAssistantErrors at this point.
-            raise
-        else:
-            # Ignore newValue at this point, needs fixing e3dc lib.
-            new_value = enabled
-            self._mydata["pset_weatherregulation_enabled"] = new_value
+            self._mydata["pset-weatherregulationenabled"] = enabled
         finally:
             self._update_guard_powersettings = False
-
-        if new_value != enabled:
-            raise HomeAssistantError(
-                f"Failed to update weather regulated charging to {enabled}"
-            )
 
         _LOGGER.debug("Successfully updated weather regulated charging to %s", enabled)
         return True
 
     async def async_set_powersave(self, enabled: bool) -> bool:
         """Enable or disable SmartPower powersaving."""
-
         _LOGGER.debug("Updating powersaving to %s", enabled)
 
-        self._update_guard_powersettings = True
-        self._mydata["pset_powersave_enabled"] = enabled
-
         try:
-            new_value: bool = await self.hass.async_add_executor_job(
-                self.e3dc.set_powersave, enabled, True
-            )
-        except:
-            _LOGGER.exception("Failed to update powersaving to %s", enabled)
-            # Once we have better exception handling available, we need to throw
-            # proper HomeAssistantErrors at this point.
-            raise
-        else:
-            # Ignore newValue at this point, needs fixing e3dc lib.
-            new_value = enabled
-            self._mydata["pset_powersave_enabled"] = new_value
+            self._update_guard_powersettings = True
+            await self.hass.async_add_executor_job(self.proxy.set_powersave, enabled)
+            self._mydata["pset-powersaving-enabled"] = enabled
         finally:
             self._update_guard_powersettings = False
 
-        if new_value != enabled:
-            raise HomeAssistantError(f"Failed to update powersaving to {enabled}")
-
-        _LOGGER.debug("Successfully updated powersaving to %s", enabled)
+        _LOGGER.debug("Updated powersaving to %s", enabled)
         return True
+
+    async def async_set_battery_before_car_mode(self, enabled: bool) -> bool:
+        """Enable or disable battery charge before car mode."""
+        _LOGGER.debug("Updating battery before car mode to %s", enabled)
+
+        try:
+            self._update_guard_wallboxsettings = True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_battery_before_car_mode, enabled
+            )
+            self._mydata["battery-before-car-mode"] = enabled
+        finally:
+            self._update_guard_wallboxsettings = False
+
+        _LOGGER.debug("Successfully updated battery before car mode to %s", enabled)
+        return True
+
+    async def async_set_battery_to_car_mode(self, enabled: bool) -> bool:
+        """Enable or disable battery charge car with battery mode."""
+        _LOGGER.debug("Updating battery to car mode to %s", enabled)
+
+        try:
+            self._update_guard_wallboxsettings = True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_battery_to_car_mode, enabled
+            )
+            self._mydata["battery-to-car-mode"] = enabled
+        finally:
+            self._update_guard_wallboxsettings = False
+
+        _LOGGER.debug("Successfully updated battery to car mode to %s", enabled)
+        return True
+
+    async def async_set_battery_wallbox_discharge_limit(self, limit: int) -> bool:
+        """Set the battery wallbox discharge limit (SoC limit)."""
+        _LOGGER.debug("Updating battery wallbox discharge limit to %s%%", limit)
+
+        try:
+            self._update_guard_wallboxsettings = True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_battery_wallbox_discharge_limit, limit
+            )
+            self._mydata["battery-wallbox-discharge-limit"] = limit
+        finally:
+            self._update_guard_wallboxsettings = False
+
+        _LOGGER.debug(
+            "Successfully updated battery wallbox discharge limit to %s%%", limit
+        )
+        return True
+
+    async def async_set_wallbox_enforce_power_assignment(self, enforce: bool) -> bool:
+        """Enable or disable wallbox enforce power assignment mode."""
+        _LOGGER.debug("Updating wallbox enforce power assignment to %s", enforce)
+
+        try:
+            self._update_guard_wallboxsettings = True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_wallbox_enforce_power_assignment, enforce
+            )
+            self._mydata["wallbox-enforce-power-assignment"] = enforce
+        finally:
+            self._update_guard_wallboxsettings = False
+
+        _LOGGER.debug(
+            "Successfully updated wallbox enforce power assignment to %s", enforce
+        )
+        return True
+
+    async def async_set_wallbox_sun_mode(
+        self, enabled: bool, wallbox_index: int
+    ) -> bool:
+        """Enable or disable wallbox sun mode."""
+        _LOGGER.debug("Updating wallbox sun mode to %s", enabled)
+
+        try:
+            self._update_guard_wallboxsettings = True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_wallbox_sun_mode, enabled, wallbox_index
+            )
+            self._mydata["wallbox-sun-mode"] = enabled
+        except Exception as ex:
+            _LOGGER.error("Failed to set wallbox sun mode to %s: %s", enabled, ex)
+            return False
+        finally:
+            self._update_guard_wallboxsettings = False
+
+        _LOGGER.debug("Successfully updated wallbox sun mode to %s", enabled)
+        return True
+
+    async def async_set_wallbox_schuko(self, enabled: bool, wallbox_index: int) -> bool:
+        """Enable or disable wallbox schuko."""
+        _LOGGER.debug("Updating wallbox schuko to %s", enabled)
+
+        try:
+            self._update_guard_wallboxsettings = True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_wallbox_schuko, enabled, wallbox_index
+            )
+            self._mydata["wallbox-schuko"] = enabled
+        except Exception as ex:
+            _LOGGER.error("Failed to set wallbox schuko to %s: %s", enabled, ex)
+            return False
+        finally:
+            self._update_guard_wallboxsettings = False
+
+        _LOGGER.debug("Successfully updated wallbox schuko to %s", enabled)
+        return True
+
+    async def async_toggle_wallbox_phases(self, wallbox_index: int) -> bool:
+        """Toggle the Wallbox Phases between 1 and 3."""
+        _LOGGER.debug("Toggling the Wallbox Phases")
+
+        try:
+            await self.hass.async_add_executor_job(
+                self.proxy.toggle_wallbox_phases, wallbox_index
+            )
+        except Exception as ex:
+            _LOGGER.error("Failed to toggle wallbox phases: %s", ex)
+            return False
+
+        _LOGGER.debug("Successfully toggled wallbox phases")
+        return True
+
+    async def async_toggle_wallbox_charging(self, wallbox_index: int) -> bool:
+        """Toggle the Wallbox charging state."""
+        _LOGGER.debug("Toggling the Wallbox charging state")
+
+        try:
+            await self.hass.async_add_executor_job(
+                self.proxy.toggle_wallbox_charging, wallbox_index
+            )
+        except Exception as ex:
+            _LOGGER.error("Failed to toggle wallbox charging state: %s", ex)
+            return False
+
+        _LOGGER.debug("Successfully toggled wallbox charging state")
+        return True
+
+    async def async_clear_power_limits(self) -> None:
+        """Clear any active power limit."""
+
+        _LOGGER.debug("Clearing any active power limit.")
+
+        # Call RSCP service.
+        # no update guard necessary, as we're called from a service, not an entity
+        await self.hass.async_add_executor_job(
+            self.proxy.set_power_limits, False, None, None
+        )
+
+        _LOGGER.debug("Successfully cleared the power limits")
+
+    async def async_set_wallbox_max_charge_current(
+        self, current: int | None, wallbox_index: int
+    ) -> None:
+        """Set the wallbox max charge current."""
+
+        # TODO: Add more refined way to deal with maximum charge current, right now it's hard coded to 32A. The max current is dependant on the local installations, many WBs are throttled at 16A, not 32A due to power grid restrictions.
+
+        # Validate the argument
+        if current is None or current <= 0:
+            raise ServiceValidationError(
+                "async_set_wallbox_max_charge_current must be called with a positive current value."
+            )
+
+        if wallbox_index < 0 or wallbox_index >= MAX_WALLBOXES_POSSIBLE:
+            raise ServiceValidationError(
+                "async_set_wallbox_max_charge_current must be called with a valid wallbox id."
+            )
+
+        upperCurrentLimit = self.getWallboxValue(wallbox_index, "upperCurrentLimit")
+        if current > upperCurrentLimit:
+            _LOGGER.warning(
+                "Requested Wallbox current of %s is too high. Limiting current to %s",
+                current,
+                upperCurrentLimit,
+            )
+            current = upperCurrentLimit
+
+        lowerCurrentLimit = self.getWallboxValue(wallbox_index, "lowerCurrentLimit")
+        if current < lowerCurrentLimit:
+            _LOGGER.warning(
+                "Requested Wallbox current of %s is too low. Limiting current to %s",
+                current,
+                lowerCurrentLimit,
+            )
+            current = lowerCurrentLimit
+
+        _LOGGER.debug("Setting wallbox max charge current to %s", current)
+
+        await self.hass.async_add_executor_job(
+            self.proxy.set_wallbox_max_charge_current, current, wallbox_index
+        )
+
+        _LOGGER.debug("Successfully set the wallbox max charge current to %s", current)
 
     async def async_set_power_limits(
         self, max_charge: int | None, max_discharge: int | None
@@ -219,18 +1086,24 @@ class E3DCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Validate the arguments, at least one has to be set.
         if max_charge is None and max_discharge is None:
-            raise ValueError(
-                "async_set_power_limits must be called with at least one of max_charge or max_discharge."
+            raise ServiceValidationError(
+                "async_set_power_limits must be called with at least one of "
+                "max_charge or max_discharge."
             )
 
-        if max_charge is not None and max_charge > self.e3dc.maxBatChargePower:
-            _LOGGER.debug("Limiting max_charge to %s", self.e3dc.maxBatChargePower)
-            max_charge = self.e3dc.maxBatChargePower
-        if max_discharge is not None and max_discharge > self.e3dc.maxBatDischargePower:
-            _LOGGER.debug(
-                "Limiting max_discharge to %s", self.e3dc.maxBatDischargePower
+        if max_charge is not None and max_charge > self.proxy.e3dc.maxBatChargePower:
+            _LOGGER.warning(
+                "Limiting max_charge to %s", self.proxy.e3dc.maxBatChargePower
             )
-            max_discharge = self.e3dc.maxBatDischargePower
+            max_charge = self.proxy.e3dc.maxBatChargePower
+        if (
+            max_discharge is not None
+            and max_discharge > self.proxy.e3dc.maxBatDischargePower
+        ):
+            _LOGGER.warning(
+                "Limiting max_discharge to %s", self.proxy.e3dc.maxBatDischargePower
+            )
+            max_discharge = self.proxy.e3dc.maxBatDischargePower
 
         _LOGGER.debug(
             "Enabling power limits, max_charge: %s, max_discharge: %s",
@@ -238,32 +1111,89 @@ class E3DCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             max_discharge,
         )
 
+        await self.hass.async_add_executor_job(
+            self.proxy.set_power_limits, True, max_charge, max_discharge
+        )
+
+        _LOGGER.debug("Successfully set the power limits")
+
+    async def async_manual_charge(self, charge_amount_wh: int) -> None:
+        """Start manual charging the given amount, zero will stop charging."""
+
+        # Validate the arguments
+        if charge_amount_wh < 0:
+            raise ServiceValidationError("Charge amount must be positive or zero.")
+
+        _LOGGER.debug(
+            "Starting manual charge of: %s Wh",
+            charge_amount_wh,
+        )
+
+        # Call RSCP service.
+        # no update guard necessary, as we're called from a service, not an entity
+        await self.hass.async_add_executor_job(
+            self.proxy.start_manual_charge, charge_amount_wh
+        )
+
+        _LOGGER.debug("Manual charging start command has been sent.")
+
+    @callback
+    def _shutdown_power_mode(self, _event: Event | None) -> None:
+        """Handle shutdown event to stop power mode updates."""
+        self._stop_power_mode()
+
+    @callback
+    def _stop_power_mode(self) -> None:
+        """Stop the power mode updates."""
+        if self._stop_set_power_mode is not None:
+            _LOGGER.debug("Stopping power mode")
+            self._stop_set_power_mode()
+            self._stop_set_power_mode = None
+        self._mydata["set-power-mode"] = SetPowerMode.NORMAL.value
+        self._mydata["set-power-value"] = None
+
+    async def _async_set_power(self, keepAlive: bool = True) -> None:
+        """Set the power mode and value based on the current state."""
+        _LOGGER.debug(
+            "Setting power mode: %s at %s W",
+            SetPowerMode.get_enum(self._mydata["set-power-mode"]).name,
+            self._mydata["set-power-value"],
+        )
+
         try:
-            # Call RSCP service.
-            # no update guard necessary, as we're called from a service, not an entity
-            result: int = await self.hass.async_add_executor_job(
-                self.e3dc.set_power_limits, True, max_charge, max_discharge, None, True
+            await self.hass.async_add_executor_job(
+                self.proxy.set_power_mode,
+                int(self._mydata["set-power-mode"]),
+                self._mydata["set-power-value"],
             )
-        except Exception as ex:
-            _LOGGER.exception("Failed to update power limits")
-            raise HomeAssistantError("Failed to update power limits") from ex
+            power_mode_str: str = str(self.proxy.get_power_mode())
+            if PowerMode.has_value(str(power_mode_str)):
+                self._mydata["power-mode"] = power_mode_str
+            else:
+                _LOGGER.debug("Unknown power mode %s", power_mode_str)
+                self._mydata["power-mode"] = f"Power mode {power_mode_str}"
+        except HomeAssistantError as ex:
+            _LOGGER.warning("Failed set power mode: %s", ex)
 
-        if result == -1:
-            raise HomeAssistantError("Failed to update power limits")
+    async def async_set_power_mode(self, mode: SetPowerMode, value: int | None) -> None:
+        """Set the power mode and value."""
+        self._mydata["set-power-mode"] = mode.value
+        self._mydata["set-power-value"] = value
 
-        if result == 1:
-            _LOGGER.warning("The given power limits are not optimal, continuing Anyway")
+        if mode == SetPowerMode.NORMAL and self._stop_set_power_mode is not None:
+            self._stop_power_mode()
         else:
-            _LOGGER.warning("Successfully set the power limits")
+            if mode != SetPowerMode.NORMAL:
+                _LOGGER.debug("Starting power mode")
+                await self._async_set_power()
+                if self._stop_set_power_mode is None:
+                    self._stop_set_power_mode = async_track_time_interval(
+                        self.hass,
+                        self._async_set_power,
+                        timedelta(seconds=10),
+                        cancel_on_shutdown=True,
+                    )
 
-
-def create_e3dcinstance(username: str, password: str, host: str, rscpkey: str) -> E3DC:
-    """Create the actual E3DC instance, this will try to connect and authenticate."""
-    e3dc = E3DC(
-        E3DC.CONNECT_LOCAL,
-        username=username,
-        password=password,
-        ipAddress=host,
-        key=rscpkey,
-    )
-    return e3dc
+    def is_farm_controller(self) -> bool:
+        """Return whether the device is a farm controller."""
+        return self._isFarmController
